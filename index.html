@@ -329,9 +329,15 @@
       </div>
 
       <div>
-        <label class="block text-sm font-medium mb-1">CORS proxy URL</label>
-        <input id="corsProxy" type="text" />
-        <p class="text-xs text-gray-500 mt-1">Browser cannot fetch eBay directly. The proxy URL is prefixed to the target. Default: <code>https://corsproxy.io/?</code> · Alternatives: <code>https://api.allorigins.win/raw?url=</code></p>
+        <label class="block text-sm font-medium mb-1">CORS proxy URL <span class="text-gray-400 font-normal">(optional override)</span></label>
+        <input id="corsProxy" type="text" placeholder="leave blank to use built-in fallback chain" />
+        <p class="text-xs text-gray-500 mt-1">By default the app tries multiple public proxies in order and caches the one that works:
+          <code>allorigins (get)</code> → <code>corsproxy.io</code> → <code>codetabs</code> → <code>thingproxy</code> → <code>cors.eu.org</code>.
+          Set this only if you want to force a specific proxy (prefix style: <code>https://my-proxy.com/?</code>).
+          Last working: <span id="lastProxyName" class="font-mono">none</span>.
+        </p>
+        <button class="btn mt-2" onclick="testProxies()">🧪 Test proxies</button>
+        <pre id="proxyTestOut" class="text-xs mt-2 max-h-32 overflow-y-auto"></pre>
       </div>
 
       <div>
@@ -368,9 +374,44 @@ const STORAGE = {
 };
 
 const DEFAULT_SETTINGS = {
-  corsProxy: 'https://corsproxy.io/?',
+  corsProxy: '',           // optional user override; empty = use built-in fallback chain
   groqKey: '',
+  lastProxy: '',           // cached strategy name that last succeeded
 };
+
+// Proxy strategies tried in order. Each: build(url)->fetchUrl, parse(resp)->htmlText
+const PROXY_STRATEGIES = [
+  {
+    name: 'allorigins-get',
+    build: (url) => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+    parse: async (resp) => { const j = await resp.json(); if (!j || typeof j.contents !== 'string') throw new Error('empty'); return j.contents; },
+    forImages: false,
+  },
+  {
+    name: 'corsproxy.io',
+    build: (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    parse: async (resp) => await resp.text(),
+    forImages: true,
+  },
+  {
+    name: 'codetabs',
+    build: (url) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(url)}`,
+    parse: async (resp) => await resp.text(),
+    forImages: true,
+  },
+  {
+    name: 'thingproxy',
+    build: (url) => `https://thingproxy.freeboard.io/fetch/${url}`,
+    parse: async (resp) => await resp.text(),
+    forImages: true,
+  },
+  {
+    name: 'cors.eu.org',
+    build: (url) => `https://cors.eu.org/${url}`,
+    parse: async (resp) => await resp.text(),
+    forImages: true,
+  },
+];
 
 let SETTINGS = loadJSON(STORAGE.settings, DEFAULT_SETTINGS);
 let QUEUE = loadJSON(STORAGE.queue, []);
@@ -438,7 +479,30 @@ function openSettings() {
   document.getElementById('corsProxy').value = SETTINGS.corsProxy || '';
   document.getElementById('groqKey').value = SETTINGS.groqKey || '';
   document.getElementById('settingsFolderName').textContent = FOLDER_HANDLE ? `Picked: ${FOLDER_NAME}` : 'Not picked.';
+  const lpn = document.getElementById('lastProxyName');
+  if (lpn) lpn.textContent = SETTINGS.lastProxy || 'none';
   document.getElementById('settingsModal').classList.remove('hidden');
+}
+
+async function testProxies() {
+  const out = document.getElementById('proxyTestOut');
+  out.textContent = 'Testing proxies against https://www.ebay.com/...';
+  const target = 'https://www.ebay.com/';
+  const lines = [];
+  for (const s of buildStrategyList()) {
+    const t0 = performance.now();
+    try {
+      const resp = await fetchWithTimeout(s.build(target), {}, 8000);
+      const ms = (performance.now() - t0).toFixed(0);
+      if (!resp.ok) { lines.push(`❌ ${s.name}: HTTP ${resp.status} (${ms}ms)`); continue; }
+      const html = await s.parse(resp);
+      lines.push(`✅ ${s.name}: ok, ${html.length} chars (${ms}ms)`);
+    } catch (e) {
+      const ms = (performance.now() - t0).toFixed(0);
+      lines.push(`❌ ${s.name}: ${e.name === 'AbortError' ? 'timeout' : e.message} (${ms}ms)`);
+    }
+    out.textContent = lines.join('\n');
+  }
 }
 function closeSettings() { document.getElementById('settingsModal').classList.add('hidden'); }
 function saveSettings() {
@@ -511,14 +575,89 @@ function extractItemIdFromUrl(url) {
   return '';
 }
 
-// ---------- eBay scraping (browser via CORS proxy) ----------
+// ---------- eBay scraping (browser via CORS proxy with multi-proxy fallback) ----------
+function canonicalEbayUrl(url) {
+  // Long /itm/ URLs with _trkparms / itmmeta / etc. cause many proxies to 403/timeout.
+  // Rewrite to the minimal canonical form: https://www.ebay.com/itm/<itemId>
+  try {
+    const u = new URL(url);
+    if (!/(^|\.)ebay\./i.test(u.hostname)) return url;
+    const id = extractItemIdFromUrl(url);
+    if (id) return `https://www.${u.hostname.replace(/^www\./,'')}/itm/${id}`;
+  } catch {}
+  return url;
+}
+
+async function fetchWithTimeout(url, opts={}, ms=12000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function buildStrategyList() {
+  const list = [];
+  // 1. User's custom proxy first if set (treated as prefix + encodeURIComponent)
+  if (SETTINGS.corsProxy && SETTINGS.corsProxy.trim()) {
+    list.push({
+      name: 'user:' + SETTINGS.corsProxy.trim(),
+      build: (url) => SETTINGS.corsProxy.trim() + encodeURIComponent(url),
+      parse: async (resp) => await resp.text(),
+      forImages: true,
+    });
+  }
+  // 2. Cached working strategy first (if any)
+  if (SETTINGS.lastProxy) {
+    const cached = PROXY_STRATEGIES.find(s => s.name === SETTINGS.lastProxy);
+    if (cached && !list.find(s => s.name === cached.name)) list.push(cached);
+  }
+  // 3. The rest, in order
+  for (const s of PROXY_STRATEGIES) {
+    if (!list.find(x => x.name === s.name)) list.push(s);
+  }
+  return list;
+}
+
+async function fetchViaProxies(url, { wantText=true, forImages=false }={}) {
+  const strategies = buildStrategyList().filter(s => !forImages || s.forImages !== false);
+  const errors = [];
+  for (const s of strategies) {
+    try {
+      const proxyUrl = s.build(url);
+      const resp = await fetchWithTimeout(proxyUrl, { headers: { 'Accept': wantText ? 'text/html,application/json' : '*/*' } }, 15000);
+      if (!resp.ok) { errors.push(`${s.name}: HTTP ${resp.status}`); continue; }
+      if (wantText) {
+        const html = await s.parse(resp);
+        if (!html || html.length < 200) { errors.push(`${s.name}: empty/short response`); continue; }
+        SETTINGS.lastProxy = s.name; saveJSON(STORAGE.settings, SETTINGS);
+        log('info', `Proxy OK: ${s.name}`);
+        return html;
+      } else {
+        const blob = await resp.blob();
+        if (!blob || blob.size === 0) { errors.push(`${s.name}: empty blob`); continue; }
+        SETTINGS.lastProxy = s.name; saveJSON(STORAGE.settings, SETTINGS);
+        return blob;
+      }
+    } catch (e) {
+      errors.push(`${s.name}: ${e.name === 'AbortError' ? 'timeout' : e.message}`);
+    }
+  }
+  throw new Error('All proxies failed: ' + errors.join(' | '));
+}
+
 async function fetchEbayHtml(url) {
-  const proxy = SETTINGS.corsProxy || DEFAULT_SETTINGS.corsProxy;
-  // Both common proxy styles take encoded URL appended; corsproxy.io & allorigins both accept this pattern.
-  const target = proxy + encodeURIComponent(url);
-  const resp = await fetch(target, { headers: { 'Accept': 'text/html' } });
-  if (!resp.ok) throw new Error('HTTP ' + resp.status);
-  return await resp.text();
+  // Try canonical (short) URL first; fall back to original if that fails.
+  const canon = canonicalEbayUrl(url);
+  try {
+    return await fetchViaProxies(canon, { wantText: true });
+  } catch (e1) {
+    if (canon === url) throw e1;
+    log('warn', 'Canonical URL failed, retrying with full URL. ' + e1.message);
+    return await fetchViaProxies(url, { wantText: true });
+  }
 }
 function pickFirstText(doc, selectors) {
   for (const sel of selectors) {
@@ -742,12 +881,17 @@ function exportCsvNow() {
   downloadBlob(new Blob([csv], { type: 'text/csv' }), 'EbayStore_Products.csv');
 }
 
-// ---------- Image download (via CORS proxy) ----------
+// ---------- Image download (via CORS proxy chain) ----------
 async function fetchImageBlob(url) {
-  const proxy = SETTINGS.corsProxy || DEFAULT_SETTINGS.corsProxy;
-  const resp = await fetch(proxy + encodeURIComponent(url));
-  if (!resp.ok) throw new Error('Image HTTP ' + resp.status);
-  return await resp.blob();
+  // Image hosts usually allow direct fetch; try direct first, then proxy chain.
+  try {
+    const resp = await fetchWithTimeout(url, { mode: 'cors' }, 10000);
+    if (resp.ok) {
+      const b = await resp.blob();
+      if (b && b.size > 0) return b;
+    }
+  } catch {}
+  return await fetchViaProxies(url, { wantText: false, forImages: true });
 }
 function extFromMimeOrUrl(blob, url) {
   const m = (blob.type || '').toLowerCase();
@@ -786,7 +930,7 @@ async function handleSingleScrape() {
   if (!url) { toast('Enter a URL', 'error'); return; }
   if (!validateEbayUrl(url)) { toast('Not a valid eBay URL', 'error'); return; }
   const out = document.getElementById('singleResults');
-  out.innerHTML = `<div class="card">⏳ Scraping… (using CORS proxy: <code>${escapeHtml(SETTINGS.corsProxy)}</code>)</div>`;
+  out.innerHTML = `<div class="card">⏳ Scraping… (auto-trying CORS proxies; last working: <code>${escapeHtml(SETTINGS.lastProxy || 'n/a')}</code>)</div>`;
   try {
     const product = await scrapeEbay(url);
     const folderName = buildProductFolderName(product.brand, product.item_id, product.title);
@@ -815,7 +959,7 @@ async function handleSingleScrape() {
     toast('Scraped: ' + product.title.slice(0, 40), 'success');
   } catch (e) {
     log('error', 'Single scrape failed: ' + e.message);
-    out.innerHTML = `<div class="card text-red-700">❌ Failed: ${escapeHtml(e.message)}<br><span class="text-sm text-gray-600">If this is a CORS error, try a different proxy in Settings (e.g. <code>https://api.allorigins.win/raw?url=</code>).</span></div>`;
+    out.innerHTML = `<div class="card text-red-700">❌ Failed: ${escapeHtml(e.message)}<br><span class="text-sm text-gray-600">All public CORS proxies were tried. Open <b>Settings → Test proxies</b> to see which (if any) work from your network. You can also paste your own proxy prefix (e.g. <code>https://my-proxy.example/?</code>).</span></div>`;
   }
 }
 
@@ -1373,7 +1517,7 @@ document.addEventListener('DOMContentLoaded', () => {
   renderQueue();
   renderChat();
   refreshAIProductSelect();
-  log('info', 'App ready. CORS proxy: ' + SETTINGS.corsProxy);
+  log('info', 'App ready. Custom proxy: ' + (SETTINGS.corsProxy || '(none, using fallback chain)') + '. Last working: ' + (SETTINGS.lastProxy || 'n/a'));
   if (!('showDirectoryPicker' in window)) {
     log('warn', 'File System Access API not supported in this browser. Folder picker disabled; downloads will be used.');
   }
