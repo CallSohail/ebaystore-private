@@ -61,6 +61,7 @@
       <p class="text-xs text-gray-500 mt-0.5">Web edition · runs entirely in your browser</p>
     </div>
     <div class="flex items-center gap-2">
+      <span id="headerBackendPill" class="pill">⏳ Checking backend</span>
       <span id="folderStatus" class="pill">📁 No folder picked</span>
       <button class="btn" onclick="openSettings()">⚙️ Settings</button>
     </div>
@@ -328,8 +329,22 @@
         <p class="text-xs text-gray-400 mt-1">Folder picker requires Chrome / Edge / Brave / Opera. Other browsers fall back to per-file downloads.</p>
       </div>
 
+      <div class="border border-emerald-200 bg-emerald-50 rounded-lg p-3">
+        <label class="block text-sm font-medium mb-1">Local Python backend <span class="text-gray-500 font-normal">(recommended)</span></label>
+        <p class="text-xs text-gray-700 mb-2">
+          Runs the original Python scraper locally — <b>no CORS proxy needed</b>. In a terminal:
+          <code class="bg-white border border-emerald-200 rounded px-1">python server.py</code>, then open <code class="bg-white border border-emerald-200 rounded px-1">http://127.0.0.1:8000/</code>.
+        </p>
+        <div class="flex items-center gap-2">
+          <span id="backendStatus" class="pill">checking…</span>
+          <button class="btn" onclick="recheckBackend()">🔄 Re-check</button>
+        </div>
+        <label class="block text-sm font-medium mt-3 mb-1">Backend URL <span class="text-gray-400 font-normal">(optional)</span></label>
+        <input id="backendUrl" type="text" placeholder="leave blank for auto-detect (http://127.0.0.1:8000)" />
+      </div>
+
       <div>
-        <label class="block text-sm font-medium mb-1">CORS proxy URL <span class="text-gray-400 font-normal">(optional override)</span></label>
+        <label class="block text-sm font-medium mb-1">CORS proxy URL <span class="text-gray-400 font-normal">(used only if backend is OFF)</span></label>
         <input id="corsProxy" type="text" placeholder="leave blank to use built-in fallback chain" />
         <p class="text-xs text-gray-500 mt-1">By default the app tries multiple public proxies in order and caches the one that works:
           <code>allorigins (get)</code> → <code>corsproxy.io</code> → <code>codetabs</code> → <code>thingproxy</code> → <code>cors.eu.org</code>.
@@ -377,7 +392,45 @@ const DEFAULT_SETTINGS = {
   corsProxy: '',           // optional user override; empty = use built-in fallback chain
   groqKey: '',
   lastProxy: '',           // cached strategy name that last succeeded
+  backendUrl: '',          // user override for local backend; empty = auto-detect
 };
+
+// ---------- Local Python backend detection ----------
+// If you run `python server.py`, the HTML uses /api/* directly (no CORS proxies).
+// Auto-detected on boot. User can override via Settings.
+let BACKEND_BASE = '';     // e.g. "" (same origin) or "http://127.0.0.1:8000"
+let BACKEND_OK  = false;   // true if /api/health responded
+
+function defaultBackendCandidates() {
+  const out = [];
+  if (SETTINGS.backendUrl && SETTINGS.backendUrl.trim()) out.push(SETTINGS.backendUrl.trim().replace(/\/+$/, ''));
+  // Same origin (works when the page is served by server.py)
+  if (location.protocol === 'http:' || location.protocol === 'https:') out.push('');
+  // Common local dev ports
+  out.push('http://127.0.0.1:8000');
+  out.push('http://localhost:8000');
+  return [...new Set(out)];
+}
+
+async function detectBackend() {
+  for (const base of defaultBackendCandidates()) {
+    try {
+      const url = (base || '') + '/api/health';
+      const resp = await fetchWithTimeout(url, {}, 1500);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data && data.ok) {
+          BACKEND_BASE = base;
+          BACKEND_OK = true;
+          log('info', `Local backend detected at ${base || '(same origin)'}`);
+          return true;
+        }
+      }
+    } catch {}
+  }
+  BACKEND_OK = false;
+  return false;
+}
 
 // Proxy strategies tried in order. Each: build(url)->fetchUrl, parse(resp)->htmlText
 const PROXY_STRATEGIES = [
@@ -477,11 +530,34 @@ function activateTab(name) {
 // ---------- Settings modal & folder picker ----------
 function openSettings() {
   document.getElementById('corsProxy').value = SETTINGS.corsProxy || '';
+  document.getElementById('backendUrl').value = SETTINGS.backendUrl || '';
   document.getElementById('groqKey').value = SETTINGS.groqKey || '';
   document.getElementById('settingsFolderName').textContent = FOLDER_HANDLE ? `Picked: ${FOLDER_NAME}` : 'Not picked.';
   const lpn = document.getElementById('lastProxyName');
   if (lpn) lpn.textContent = SETTINGS.lastProxy || 'none';
+  refreshBackendStatusPill();
   document.getElementById('settingsModal').classList.remove('hidden');
+}
+
+function refreshBackendStatusPill() {
+  const pill = document.getElementById('backendStatus');
+  const head = document.getElementById('headerBackendPill');
+  const txt = BACKEND_OK
+    ? `🟢 Backend ON (${BACKEND_BASE || 'same origin'})`
+    : `⚪ Backend OFF — using CORS proxies`;
+  if (pill) pill.textContent = txt;
+  if (head) head.textContent = BACKEND_OK ? '🟢 Backend' : '⚪ Proxy mode';
+}
+
+async function recheckBackend() {
+  // Apply user-typed backendUrl first (without saving) so they can test without saving
+  const typed = (document.getElementById('backendUrl') || {}).value || '';
+  const original = SETTINGS.backendUrl;
+  SETTINGS.backendUrl = typed.trim();
+  await detectBackend();
+  SETTINGS.backendUrl = original;
+  refreshBackendStatusPill();
+  toast(BACKEND_OK ? 'Backend reachable' : 'Backend not reachable', BACKEND_OK ? 'success' : 'error');
 }
 
 async function testProxies() {
@@ -505,10 +581,13 @@ async function testProxies() {
   }
 }
 function closeSettings() { document.getElementById('settingsModal').classList.add('hidden'); }
-function saveSettings() {
+async function saveSettings() {
   SETTINGS.corsProxy = document.getElementById('corsProxy').value.trim() || DEFAULT_SETTINGS.corsProxy;
+  SETTINGS.backendUrl = document.getElementById('backendUrl').value.trim();
   SETTINGS.groqKey = document.getElementById('groqKey').value.trim();
   saveJSON(STORAGE.settings, SETTINGS);
+  await detectBackend();
+  refreshBackendStatusPill();
   toast('Settings saved', 'success');
   closeSettings();
   refreshFolderHints();
@@ -771,8 +850,45 @@ function extractImageUrls(doc) {
   }
   return [...new Set(out)];
 }
+async function scrapeViaBackend(url) {
+  const resp = await fetchWithTimeout((BACKEND_BASE || '') + '/api/scrape', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url }),
+  }, 60000);
+  if (!resp.ok) throw new Error('Backend HTTP ' + resp.status);
+  const data = await resp.json();
+  if (!data.success) throw new Error(data.error || 'backend scrape failed');
+  // Normalize to the shape the rest of the UI expects
+  const p = data.product || {};
+  return {
+    url: p.url || url,
+    title: p.title || '',
+    price: p.price || '',
+    condition: p.condition || '',
+    seller: p.seller || '',
+    shipping: p.shipping || '',
+    description: p.description || '',
+    brand: p.brand || '',
+    item_specifics: p.item_specifics || {},
+    scraped_at: p.scraped_at || nowStamp(),
+    item_id: p.item_id || '',
+    image_urls: data.image_urls || [],
+  };
+}
+
 async function scrapeEbay(url) {
   log('info', 'Scraping ' + url);
+  // Prefer the local Python backend if available – it bypasses CORS entirely.
+  if (BACKEND_OK) {
+    try {
+      const product = await scrapeViaBackend(url);
+      if (product && product.title) return product;
+      log('warn', 'Backend returned no title; falling back to in-browser scrape');
+    } catch (e) {
+      log('warn', 'Backend scrape failed (' + e.message + '); falling back to in-browser scrape');
+    }
+  }
   const html = await fetchEbayHtml(url);
   const doc = new DOMParser().parseFromString(html, 'text/html');
 
@@ -881,9 +997,19 @@ function exportCsvNow() {
   downloadBlob(new Blob([csv], { type: 'text/csv' }), 'EbayStore_Products.csv');
 }
 
-// ---------- Image download (via CORS proxy chain) ----------
+// ---------- Image download (backend > direct > proxy chain) ----------
 async function fetchImageBlob(url) {
-  // Image hosts usually allow direct fetch; try direct first, then proxy chain.
+  // 1. Local backend if running
+  if (BACKEND_OK) {
+    try {
+      const resp = await fetchWithTimeout((BACKEND_BASE || '') + '/api/image?url=' + encodeURIComponent(url), {}, 20000);
+      if (resp.ok) {
+        const b = await resp.blob();
+        if (b && b.size > 0) return b;
+      }
+    } catch {}
+  }
+  // 2. Direct fetch (image hosts often allow CORS for static assets)
   try {
     const resp = await fetchWithTimeout(url, { mode: 'cors' }, 10000);
     if (resp.ok) {
@@ -891,6 +1017,7 @@ async function fetchImageBlob(url) {
       if (b && b.size > 0) return b;
     }
   } catch {}
+  // 3. Proxy chain fallback
   return await fetchViaProxies(url, { wantText: false, forImages: true });
 }
 function extFromMimeOrUrl(blob, url) {
@@ -1512,7 +1639,7 @@ function downloadLogs() {
 function clearLogs() { LOGS = []; saveJSON(STORAGE.logs, LOGS); renderLogs(); }
 
 // ---------- Boot ----------
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
   refreshFolderHints();
   renderQueue();
   renderChat();
@@ -1520,6 +1647,13 @@ document.addEventListener('DOMContentLoaded', () => {
   log('info', 'App ready. Custom proxy: ' + (SETTINGS.corsProxy || '(none, using fallback chain)') + '. Last working: ' + (SETTINGS.lastProxy || 'n/a'));
   if (!('showDirectoryPicker' in window)) {
     log('warn', 'File System Access API not supported in this browser. Folder picker disabled; downloads will be used.');
+  }
+  await detectBackend();
+  refreshBackendStatusPill();
+  if (BACKEND_OK) {
+    toast('Local Python backend connected — no proxy needed', 'success');
+  } else {
+    log('info', 'No local backend detected. To bypass CORS proxies, run `python server.py` and reload http://127.0.0.1:8000/');
   }
 });
 </script>
