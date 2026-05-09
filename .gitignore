@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Logs
+*.log
+
+# Local config / runtime data
+.batch_queue.json
+.groq_config.json
+.gsheet_config.json
+EbayStore_Products.csv
+downloads/
+
+# OS
+.DS_Store
+Thumbs.db
