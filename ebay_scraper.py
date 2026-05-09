@@ -6,9 +6,9 @@ A production-ready eBay product scraper with integrated AI processing capabiliti
 Features include:
 - Robust eBay product data extraction
 - Concurrent image downloading with optimization
-- Google Sheets integration
+- Local CSV storage (EbayStore_Products.csv)
 - AI-powered content enhancement with Groq
-- Batch processing capabilities
+- Batch processing capabilities (local JSON-backed queue)
 - Comprehensive error handling and logging
 - Modern UI with performance optimizations
 
@@ -31,8 +31,6 @@ import json
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Any
 import logging
-import gspread
-from google.oauth2.service_account import Credentials
 import csv
 from groq import Groq
 from dataclasses import dataclass, asdict
@@ -1198,525 +1196,6 @@ class EbayScraper:
             return ScrapingResult(success=False, error_message=f"An unexpected error occurred. Please try again.")
 
 # =============================================================================
-# GOOGLE SHEETS INTEGRATION
-# =============================================================================
-
-class GoogleSheetsManager:
-    """
-    Manages Google Sheets operations with robust error handling.
-    
-    Handles:
-    - Service account authentication
-    - Spreadsheet and worksheet management
-    - Data insertion and updates
-    - Batch processing operations
-    """
-    
-    def __init__(self, service_account_info: Optional[Dict] = None):
-        """Initialize with service account credentials."""
-        self.client = self._init_client(service_account_info)
-        self.config_path = Path.cwd() / '.gsheet_config.json'
-        self.quota_exceeded: bool = False
-    
-    def _init_client(self, service_account_info: Optional[Dict]) -> Optional[gspread.Client]:
-        """Initialize Google Sheets client with error handling."""
-        try:
-            if not service_account_info:
-                logger.warning("No service account info provided")
-                return None
-            
-            if isinstance(service_account_info, str):
-                service_account_info = json.loads(service_account_info)
-            
-            scopes = [
-                'https://www.googleapis.com/auth/spreadsheets',
-                'https://www.googleapis.com/auth/drive'
-            ]
-            
-            # Configure credentials to bypass proxy
-            # Environment variables set at module level should handle proxy bypass
-            credentials = Credentials.from_service_account_info(
-                service_account_info, 
-                scopes=scopes
-            )
-            
-            # Create client - proxy bypass is handled by environment variables
-            client = gspread.authorize(credentials)
-            
-            logger.info("Google Sheets client initialized successfully")
-            return client
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize Google Sheets client: {e}")
-            return None
-    
-    def is_available(self) -> bool:
-        """Check if Google Sheets client is available."""
-        return self.client is not None
-    
-    def ensure_spreadsheet_and_worksheet(self, title: str = 'EbayStore_Products', 
-                                       worksheet_name: str = 'Products',
-                                       share_email: Optional[str] = None,
-                                       allow_create: bool = True) -> Tuple[Optional[Any], Optional[Any]]:
-        """
-        Ensure spreadsheet and worksheet exist, creating if necessary.
-        
-        Args:
-            title: Spreadsheet title
-            worksheet_name: Worksheet name
-            share_email: Email to share spreadsheet with
-            
-        Returns:
-            Tuple of (spreadsheet, worksheet) objects
-        """
-        if not self.client:
-            return None, None
-        
-        try:
-            spreadsheet = None
-            
-            # Try to open by an explicit Sheet ID from env/secrets/config
-            if self.config_path.exists():
-                try:
-                    config = json.load(open(self.config_path, 'r', encoding='utf-8'))
-                    sheet_id = config.get('sheet_id')
-                    if sheet_id:
-                        spreadsheet = self.client.open_by_key(sheet_id)
-                        logger.debug(f"Opened existing spreadsheet: {sheet_id}")
-                except Exception:
-                    logger.debug("Failed to open spreadsheet from config")
-            if not spreadsheet:
-                # Environment/config override
-                try:
-                    import streamlit as _st
-                    if hasattr(_st, 'secrets') and 'sheet_id' in _st.secrets:
-                        secret_id = str(_st.secrets['sheet_id']).strip()
-                    else:
-                        secret_id = ''
-                except Exception:
-                    secret_id = ''
-                env_id = os.getenv('EBAY_SHEET_ID', '').strip()
-                sheet_id = secret_id or env_id or DEFAULT_SHEET_ID
-                if sheet_id:
-                    try:
-                        spreadsheet = self.client.open_by_key(sheet_id)
-                        logger.debug(f"Opened spreadsheet by provided sheet_id: {sheet_id}")
-                    except Exception:
-                        logger.debug("Failed to open spreadsheet by provided sheet_id")
-            
-            # Try to open by title
-            if not spreadsheet:
-                try:
-                    spreadsheet = self.client.open(title)
-                    logger.debug(f"Opened spreadsheet by title: {title}")
-                except Exception:
-                    logger.debug(f"Spreadsheet '{title}' not found")
-            
-            # Try known alternative titles
-            if not spreadsheet:
-                for alt_title in SHEET_TITLES_TO_TRY:
-                    try:
-                        spreadsheet = self.client.open(alt_title)
-                        logger.debug(f"Opened spreadsheet by alternative title: {alt_title}")
-                        break
-                    except Exception:
-                        continue
-            
-            # Create new spreadsheet
-            if not spreadsheet:
-                if not allow_create:
-                    logger.debug("Creation disabled; returning without spreadsheet.")
-                    return None, None
-                try:
-                    spreadsheet = self.client.create(title)
-                    logger.info(f"Created new spreadsheet: {title}")
-                except Exception as e:
-                    # Detect Drive quota exceeded and set flag for graceful fallback
-                    err_text = str(e).lower()
-                    if ("quota" in err_text and "exceeded" in err_text) or ("403" in err_text and "quota" in err_text):
-                        self.quota_exceeded = True
-                        logger.error("Drive storage quota exceeded. Falling back to CSV only.")
-                        return None, None
-                    logger.error(f"Could not create spreadsheet: {e}")
-                    return None, None
-                
-                # Save config
-                try:
-                    config = {'sheet_id': spreadsheet.id, 'worksheet_name': worksheet_name}
-                    json.dump(config, open(self.config_path, 'w', encoding='utf-8'))
-                except Exception as e:
-                    logger.warning(f"Could not save spreadsheet config: {e}")
-            
-            # Ensure worksheet exists
-            try:
-                worksheet = spreadsheet.worksheet(worksheet_name)
-                logger.debug(f"Found existing worksheet: {worksheet_name}")
-            except gspread.WorksheetNotFound:
-                # Try several common worksheet names
-                worksheet = None
-                for guess in WORKSHEET_NAMES_TO_TRY:
-                    try:
-                        worksheet = spreadsheet.worksheet(guess)
-                        logger.info(f"Using worksheet by alternative name: {guess}")
-                        break
-                    except Exception:
-                        continue
-                # Fallback to first worksheet if present
-                if not worksheet:
-                    try:
-                        worksheets = spreadsheet.worksheets()
-                        if worksheets:
-                            worksheet = worksheets[DEFAULT_WORKSHEET_INDEX]
-                            logger.info(f"Using fallback worksheet: {worksheet.title}")
-                    except Exception:
-                        pass
-                # Create if still none
-                if not worksheet:
-                    worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=20)
-                    logger.info(f"Created new worksheet: {worksheet_name}")
-            
-            # Ensure header row
-            self._ensure_header(worksheet)
-            
-            # Share if email provided
-            if share_email:
-                try:
-                    spreadsheet.share(share_email, perm_type='user', role='writer', notify=False)
-                    logger.info(f"Shared spreadsheet with: {share_email}")
-                except Exception as e:
-                    logger.warning(f"Could not share spreadsheet: {e}")
-            
-            # Success – clear any previous quota flag and return
-            self.quota_exceeded = False
-            # Success – clear any previous quota flag and return
-            self.quota_exceeded = False
-            return spreadsheet, worksheet
-            
-        except Exception as e:
-            err_text = str(e).lower()
-            if ("quota" in err_text and "exceeded" in err_text) or ("403" in err_text and "quota" in err_text):
-                self.quota_exceeded = True
-                logger.error("Error ensuring spreadsheet/worksheet: Drive storage quota exceeded. Using CSV fallback.")
-            else:
-                logger.error(f"Error ensuring spreadsheet/worksheet: {e}")
-            return None, None
-    
-    def _ensure_header(self, worksheet) -> None:
-        """Ensure worksheet has proper header row."""
-        try:
-            existing = worksheet.get_all_values()
-            if not existing:
-                header = [
-                    'Scraped At', 'eBay URL', 'Title', 'Price', 'Condition', 
-                    'Brand', 'Seller', 'Shipping', 'Description', 'Item Specifics'
-                ]
-                worksheet.append_row(header)
-                logger.debug("Added header row to worksheet")
-        except Exception as e:
-            logger.warning(f"Could not ensure header: {e}")
-    
-    def append_product_data(self, product_data: ProductData, share_email: Optional[str] = None) -> bool:
-        """
-        Append product data to auto-managed Google Sheet.
-        
-        Args:
-            product_data: ProductData object to append
-            share_email: Optional email to share sheet with
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            # Open only existing sheet; do not create
-            spreadsheet, worksheet = self.ensure_spreadsheet_and_worksheet(share_email=share_email, allow_create=False)
-            if not worksheet:
-                return False
-            
-            # Prepare row data
-            item_specifics_str = " | ".join([
-                f"{k}: {v}" for k, v in product_data.item_specifics.items()
-            ])
-            
-            row = [
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                product_data.url,
-                product_data.title,
-                product_data.price,
-                product_data.condition,
-                product_data.brand,
-                product_data.seller,
-                product_data.shipping,
-                (product_data.description or '')[:1000],  # Limit description length
-                item_specifics_str,
-            ]
-            
-            worksheet.append_row(row)
-            logger.info("Successfully appended product data to Google Sheet")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error appending to Google Sheet: {e}")
-            return False
-
-    def append_to_ebay_product_list(self, product_data: ProductData) -> bool:
-        """Upsert into user's 'ebay_Product_List' worksheet; update row if URL exists, else append.
-
-        Expected columns (order can vary):
-        eBay_URL, Status, Title, Selling Price, Condition, % margin, Listing Platform, Date of listing, brand, Notes
-        """
-        if not self.client:
-            return False
-        try:
-            _, worksheet = self.ensure_spreadsheet_and_worksheet(
-                title='ebay_Product_List',
-                worksheet_name='ebay_Product_List',
-                allow_create=False
-            )
-            if not worksheet:
-                return False
-
-            values = worksheet.get_all_values()
-            header = values[0] if values else []
-            if not header:
-                header = ['Item ID', 'eBay_URL', 'Status', 'Title', 'Selling Price', 'Condition', '% margin', 'Listing Platform', 'Date of listing', 'brand', 'Notes']
-                worksheet.append_row(header)
-
-            header_map = self._get_header_map(worksheet)
-
-            def val(col_name: str) -> str:
-                name = col_name.strip().lower()
-                if name in ('item id', 'id', 'ebay item number', 'ebay id'):
-                     return product_data.item_id
-                if name in ('ebay_url', 'ebay url', 'url', 'link'):
-                    return product_data.url
-                if name == 'status':
-                    return 'done'
-                if name == 'title':
-                    return product_data.title
-                if name in ('selling price', 'price'):
-                    return product_data.price
-                if name == 'condition':
-                    return product_data.condition
-                if name in ('% margin', 'margin', 'profit %'):
-                    return ''
-                if name in ('listing platform', 'platform'):
-                    return 'eBay'
-                if name in ('date of listing', 'date'):
-                    return datetime.now().strftime('%Y-%m-%d')
-                if name == 'brand':
-                    return product_data.brand
-                if name in ('seller', 'seller name'):
-                    return product_data.seller
-                if name == 'shipping':
-                    return product_data.shipping
-                if name in ('description', 'desc'):
-                    return (product_data.description or '')[:1000]
-                if name in ('item specifics', 'item_specifics', 'specifics'):
-                    return " | ".join([f"{k}: {v}" for k, v in product_data.item_specifics.items()])
-                if name == 'notes':
-                    # Fallback: brief description snippet if no dedicated column exists
-                    snippet = (product_data.description or '')[:140]
-                    return snippet
-                return ''
-
-            new_row = [val(c) for c in header]
-
-            # Upsert by URL
-            row_index = self._find_row_by_url(worksheet, product_data.url)
-            if row_index:
-                start_col = 1
-                end_col = len(header)
-                a1 = gspread.utils.rowcol_to_a1(row_index, start_col) + ':' + gspread.utils.rowcol_to_a1(row_index, end_col)
-                worksheet.update(a1, [new_row])
-                logger.info("Updated existing row in 'ebay_Product_List'")
-                return True
-            else:
-                worksheet.append_row(new_row)
-                logger.info("Appended new row to 'ebay_Product_List'")
-                return True
-        except Exception as e:
-            logger.warning(f"Could not upsert to 'ebay_Product_List': {e}")
-            return False
-
-    # ---------- Utilities for duplicates and status updates ----------
-    @staticmethod
-    def _normalize_key(name: str) -> str:
-        return re.sub(r"[^a-z0-9]", "", name.lower())
-
-    def _get_header_map(self, worksheet) -> Dict[str, int]:
-        try:
-            values = worksheet.get_all_values()
-            header = values[0] if values else []
-            mapping: Dict[str, int] = {}
-            for idx, col in enumerate(header):
-                mapping[self._normalize_key(col)] = idx
-            return mapping
-        except Exception:
-            return {}
-
-    def _find_row_by_url(self, worksheet, url: str) -> Optional[int]:
-        try:
-            values = worksheet.get_all_values()
-            if not values:
-                return None
-            header = values[0]
-            header_map = self._get_header_map(worksheet)
-            # Try common keys for URL
-            for key in ["ebayurl", "ebay_url", "url", "link", "ebayitemurl"]:
-                if key in header_map:
-                    url_idx = header_map[key]
-                    break
-            else:
-                # try to guess by 'http' presence in first data row
-                url_idx = None
-                if len(values) > 1:
-                    for idx, col in enumerate(values[1]):
-                        if col.startswith("http"):
-                            url_idx = idx
-                            break
-                if url_idx is None:
-                    return None
-            # Search rows
-            for i, row in enumerate(values[1:], start=2):  # 1-based in Sheets, header is row 1
-                if len(row) > url_idx and row[url_idx].strip() == url.strip():
-                    return i
-            return None
-        except Exception:
-            return None
-
-    def url_exists(self, url: str) -> bool:
-        if not self.client:
-            return False
-        try:
-            # Only check ebay_Product_List style sheet
-            _, ws2 = self.ensure_spreadsheet_and_worksheet(title='ebay_Product_List', worksheet_name='ebay_Product_List', allow_create=False)
-            if ws2 and self._find_row_by_url(ws2, url):
-                return True
-        except Exception:
-            return False
-        return False
-
-    def update_status_by_url(self, url: str, status: str = "Done") -> bool:
-        if not self.client:
-            return False
-        try:
-            _, worksheet = self.ensure_spreadsheet_and_worksheet(title='ebay_Product_List', worksheet_name='ebay_Product_List', allow_create=False)
-            if not worksheet:
-                return False
-            row_index = self._find_row_by_url(worksheet, url)
-            if not row_index:
-                return False
-            header_map = self._get_header_map(worksheet)
-            status_idx = header_map.get("status")
-            if status_idx is None:
-                return False
-            # gspread cells are 1-based
-            worksheet.update_cell(row_index, status_idx + 1, status)
-            logger.info(f"Updated status to '{status}' for URL in 'ebay_Product_List'")
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to update status: {e}")
-            return False
-
-    def ensure_columns(self, worksheet, required_columns: List[str]) -> Dict[str, int]:
-        """
-        Ensure required columns exist in the worksheet header. Add missing ones.
-        
-        Args:
-            worksheet: gspread worksheet object
-            required_columns: List of column names to ensure exist
-            
-        Returns:
-            Dict mapping column name (normalized) to column index
-        """
-        try:
-            values = worksheet.get_all_values()
-            header = values[0] if values else []
-            header_map = {self._normalize_key(col): i for i, col in enumerate(header)}
-            
-            # Find missing columns
-            missing = []
-            for col in required_columns:
-                if self._normalize_key(col) not in header_map:
-                    missing.append(col)
-            
-            # Add missing columns to header
-            if missing:
-                new_header = header + missing
-                worksheet.update('1:1', [new_header])
-                # Rebuild header map
-                header_map = {self._normalize_key(col): i for i, col in enumerate(new_header)}
-                logger.info(f"Added missing columns to sheet: {missing}")
-            
-            return header_map
-        except Exception as e:
-            logger.error(f"Error ensuring columns: {e}")
-            return {}
-
-    def update_row_with_product_data(self, url: str, product_data: ProductData) -> bool:
-        """
-        Update an existing row (identified by URL) with all product data.
-        
-        Args:
-            url: The eBay URL to find the row
-            product_data: ProductData object with scraped data
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        if not self.client:
-            return False
-        try:
-            _, worksheet = self.ensure_spreadsheet_and_worksheet(
-                title='ebay_Product_List', 
-                worksheet_name='ebay_Product_List', 
-                allow_create=False
-            )
-            if not worksheet:
-                return False
-            
-            # Ensure all required columns exist
-            required_columns = ['URL', 'Title', 'Price', 'Condition', 'Item ID', 'Brand', 'Status', 'Processed Date']
-            header_map = self.ensure_columns(worksheet, required_columns)
-            
-            # Find the row
-            row_index = self._find_row_by_url(worksheet, url)
-            if not row_index:
-                logger.warning(f"Row not found for URL: {url}")
-                return False
-            
-            # Get current row data
-            current_row = worksheet.row_values(row_index)
-            
-            # Extend row if needed
-            max_col = max(header_map.values()) + 1 if header_map else len(current_row)
-            while len(current_row) < max_col:
-                current_row.append('')
-            
-            # Update specific columns
-            def set_col(key: str, value: str):
-                idx = header_map.get(self._normalize_key(key))
-                if idx is not None and idx < len(current_row):
-                    current_row[idx] = value
-            
-            set_col('Title', product_data.title or '')
-            set_col('Price', product_data.price or '')
-            set_col('Condition', product_data.condition or '')
-            set_col('Item ID', product_data.item_id or '')
-            set_col('Brand', product_data.brand or '')
-            set_col('Status', 'Done')
-            set_col('Processed Date', datetime.now().strftime('%Y-%m-%d %H:%M'))
-            
-            # Update the row in sheet
-            worksheet.update(f'{row_index}:{row_index}', [current_row])
-            logger.info(f"Updated row {row_index} with product data for: {product_data.title[:30]}...")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to update row with product data: {e}")
-            return False
-
-# =============================================================================
 # LOCAL CSV FALLBACK
 # =============================================================================
 
@@ -2395,27 +1874,29 @@ class FileManager:
         except Exception:
             return []
     
-    def create_product_folder(self, product_title: str, item_id: str = "") -> Path:
+    def create_product_folder(self, brand: str, item_id: str = "", fallback_title: str = "") -> Path:
         """
-        Create and return product-specific folder path.
-        
-        Args:
-            product_title: Product title for folder naming
-            item_id: Optional eBay Item ID to append for uniqueness
-            
-        Returns:
-            Path object for product folder
+        Create and return product-specific folder path named "<Brand> <ItemID>".
+
+        Falls back to the first word of the title when brand is missing.
         """
         try:
-            clean_title = clean_filename(product_title)
-            # Append ID for uniqueness and identification if present
-            folder_name = f"{clean_title} - {item_id}" if item_id else clean_title
-            
+            raw_brand = (brand or "").strip()
+            if not raw_brand:
+                first_word = (fallback_title or "").strip().split()[0:1]
+                raw_brand = first_word[0] if first_word else "Unknown"
+
+            brand_part = clean_filename(raw_brand, max_length=60) or "Unknown"
+            raw_id = str(item_id or "").strip()
+            id_part = clean_filename(raw_id, max_length=40) if raw_id else ""
+
+            folder_name = f"{brand_part} {id_part}".strip() if id_part else brand_part
+
             product_folder = self.base_dir / folder_name
             product_folder.mkdir(exist_ok=True)
             logger.debug(f"Created product folder: {product_folder}")
             return product_folder
-            
+
         except Exception as e:
             logger.error(f"Error creating product folder: {e}")
             raise
@@ -2661,47 +2142,6 @@ class FileManager:
 # STREAMLIT APPLICATION
 # =============================================================================
 
-def load_credentials() -> Optional[Dict]:
-    """Load Google service account credentials from file or Streamlit secrets."""
-    try:
-        # Try Streamlit secrets first (handle case where secrets.toml doesn't exist)
-        if hasattr(st, 'secrets') and 'gcp_service_account' in st.secrets:
-             secret_value = st.secrets["gcp_service_account"]
-             # Handle JSON string vs Dict
-             if isinstance(secret_value, str):
-                 return json.loads(secret_value)
-             return dict(secret_value)
-    except Exception as e:
-        logger.error(f"Error loading secrets: {e}")
-        # Secrets not configured or parse error - silent failure to allow fallback
-        pass
-    
-    # Try common filenames
-    common_names = [
-        'service_account.json',
-        'credentials.json',
-        'gcp_credentials.json',
-    ]
-    for name in common_names:
-        creds_path = Path.cwd() / name
-        if creds_path.exists():
-            with open(creds_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    
-    # Auto-detect: Look for any JSON file that looks like a service account
-    for json_file in Path.cwd().glob('*.json'):
-        try:
-            with open(json_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                # Check if it's a service account file
-                if data.get('type') == 'service_account' and 'private_key' in data:
-                    logger.info(f"Auto-detected service account file: {json_file.name}")
-                    return data
-        except Exception:
-            continue
-    
-    return None
-
 def load_groq_api_key() -> str:
     """Load Groq API key from Streamlit secrets, environment, or local config file."""
     # 1) Streamlit secrets
@@ -2737,6 +2177,414 @@ def save_groq_api_key(api_key: str) -> bool:
     except Exception as e:
         logger.error(f"Failed to save Groq API key: {e}")
         return False
+
+# =============================================================================
+# BATCH QUEUE (LOCAL JSON-BACKED)
+# =============================================================================
+
+BATCH_QUEUE_PATH = Path.cwd() / '.batch_queue.json'
+_BATCH_QUEUE_LOCK = threading.Lock()
+
+
+def parse_url_input(text: str) -> List[str]:
+    """
+    Parse a free-form blob of URLs into a clean list.
+
+    Splits on newlines, commas, semicolons, tabs and surrounding whitespace.
+    Strips leading/trailing punctuation (quotes, commas, semicolons) so a
+    trailing comma like "https://...,," produces a single clean URL.
+    Empty tokens are dropped.
+    """
+    if not text:
+        return []
+    tokens = re.split(r'[\s,;]+', text)
+    cleaned: List[str] = []
+    for tok in tokens:
+        tok = tok.strip().strip('\'"').strip(',;')
+        if tok:
+            cleaned.append(tok)
+    return cleaned
+
+
+def load_batch_queue() -> List[Dict[str, Any]]:
+    """Load batch queue from local JSON file. Each item: {url, status, note, updated_at, error}."""
+    try:
+        if BATCH_QUEUE_PATH.exists():
+            with open(BATCH_QUEUE_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+    except Exception as e:
+        logger.warning(f"Could not read batch queue: {e}")
+    return []
+
+
+def save_batch_queue(queue: List[Dict[str, Any]]) -> bool:
+    try:
+        with _BATCH_QUEUE_LOCK:
+            with open(BATCH_QUEUE_PATH, 'w', encoding='utf-8') as f:
+                json.dump(queue, f, indent=2)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save batch queue: {e}")
+        return False
+
+
+def update_queue_status(url: str, status: str, error: str = "") -> None:
+    """Thread-safe single-item status update persisted to disk."""
+    with _BATCH_QUEUE_LOCK:
+        queue = []
+        try:
+            if BATCH_QUEUE_PATH.exists():
+                with open(BATCH_QUEUE_PATH, 'r', encoding='utf-8') as f:
+                    queue = json.load(f) or []
+        except Exception:
+            queue = []
+        for item in queue:
+            if item.get('url') == url:
+                item['status'] = status
+                item['error'] = error
+                item['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                break
+        try:
+            with open(BATCH_QUEUE_PATH, 'w', encoding='utf-8') as f:
+                json.dump(queue, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed persisting queue status: {e}")
+
+
+def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> None:
+    """Local-CSV-backed batch processing tab."""
+    st.subheader("Batch Processing Operations")
+    st.caption("Queue is stored locally in `.batch_queue.json`. Scraped data is appended to `EbayStore_Products.csv`.")
+
+    if 'batch_queue' not in st.session_state:
+        st.session_state.batch_queue = load_batch_queue()
+
+    # --- Add New Items Section ---
+    st.markdown("### 📥 Add Links to Batch")
+
+    input_tab1, input_tab2 = st.tabs(["📁 File Upload (CSV/Excel)", "📝 Manual Paste"])
+
+    new_urls_to_add: List[str] = []
+    source_note = "Batch Import"
+
+    with input_tab1:
+        uploaded_file = st.file_uploader(
+            "Upload File",
+            type=['csv', 'xlsx', 'xls'],
+            help="Upload a list of URLs. Auto-detects URL/link/eBay column.",
+        )
+        if uploaded_file:
+            try:
+                if uploaded_file.name.lower().endswith('.csv'):
+                    df = pd.read_csv(uploaded_file)
+                else:
+                    df = pd.read_excel(uploaded_file)
+
+                if df is not None and not df.empty:
+                    possible_cols = [c for c in df.columns if any(x in str(c).lower() for x in ['url', 'link', 'ebay', 'website'])]
+                    target_col = possible_cols[0] if possible_cols else df.columns[0]
+                    st.caption(f"Reading URLs from column: `{target_col}`")
+                    raw = " ".join(df[target_col].dropna().astype(str).tolist())
+                    new_urls_to_add.extend(parse_url_input(raw))
+                    source_note = f"Import: {uploaded_file.name}"
+            except Exception as e:
+                st.error(f"Error reading file: {e}")
+
+    with input_tab2:
+        pasted_text = st.text_area(
+            "Paste eBay URLs (newline OR comma-separated; trailing commas are fine)",
+            height=200,
+            placeholder="https://www.ebay.com/itm/123, https://www.ebay.com/itm/456,\nhttps://www.ebay.com/itm/789",
+        )
+        if pasted_text:
+            new_urls_to_add.extend(parse_url_input(pasted_text))
+            if not source_note.startswith("Import"):
+                source_note = "Manual Paste"
+
+    if new_urls_to_add:
+        valid_urls: List[str] = []
+        invalid_urls: List[str] = []
+        for u in new_urls_to_add:
+            try:
+                if scraper.validate_ebay_url(u):
+                    valid_urls.append(u)
+                else:
+                    invalid_urls.append(u)
+            except Exception:
+                invalid_urls.append(u)
+
+        valid_urls = list(dict.fromkeys(valid_urls))
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.success(f"✅ {len(valid_urls)} valid eBay URL(s) ready to add.")
+        with col_b:
+            if invalid_urls:
+                with st.expander(f"⚠️ {len(invalid_urls)} invalid entries skipped"):
+                    for bad in invalid_urls[:30]:
+                        st.code(bad, language=None)
+
+        if valid_urls and st.button(f"➕ Add {len(valid_urls)} Items to Queue", type="primary"):
+            existing_urls = {item['url'] for item in st.session_state.batch_queue}
+            added = 0
+            for url in valid_urls:
+                if url not in existing_urls:
+                    st.session_state.batch_queue.append({
+                        'url': url,
+                        'status': 'Pending',
+                        'note': source_note,
+                        'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'error': '',
+                    })
+                    existing_urls.add(url)
+                    added += 1
+            save_batch_queue(st.session_state.batch_queue)
+            if added:
+                st.toast(f"Added {added} new items to the batch queue!", icon="🚀")
+                st.rerun()
+            else:
+                st.warning("All provided URLs are already in the batch list.")
+
+    # --- Queue View ---
+    st.markdown("---")
+    st.markdown("### 📋 Current Queue")
+
+    queue = st.session_state.batch_queue
+    pending_items = [it for it in queue if it.get('status', '').lower() == 'pending']
+    done_items = [it for it in queue if it.get('status', '').lower() == 'done']
+    error_items = [it for it in queue if it.get('status', '').lower().startswith('error')]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total", len(queue))
+    m2.metric("Pending", len(pending_items))
+    m3.metric("Done", len(done_items))
+    m4.metric("Errors", len(error_items))
+
+    if queue:
+        df_view = pd.DataFrame(queue)[['url', 'status', 'note', 'updated_at', 'error']]
+        st.dataframe(df_view, use_container_width=True, hide_index=True)
+
+        col_clear1, col_clear2, col_clear3 = st.columns(3)
+        with col_clear1:
+            if st.button("🗑️ Clear Done"):
+                st.session_state.batch_queue = [it for it in queue if it.get('status', '').lower() != 'done']
+                save_batch_queue(st.session_state.batch_queue)
+                st.rerun()
+        with col_clear2:
+            if st.button("🔄 Reset Errors to Pending"):
+                changed = 0
+                for it in st.session_state.batch_queue:
+                    if it.get('status', '').lower().startswith('error'):
+                        it['status'] = 'Pending'
+                        it['error'] = ''
+                        changed += 1
+                save_batch_queue(st.session_state.batch_queue)
+                if changed:
+                    st.toast(f"Reset {changed} error item(s).", icon="🔄")
+                    st.rerun()
+        with col_clear3:
+            if st.button("❌ Clear Entire Queue"):
+                st.session_state.batch_queue = []
+                save_batch_queue([])
+                st.rerun()
+
+    # --- Processing Section ---
+    st.markdown("---")
+    st.markdown("### ⚙️ Processing Control")
+
+    max_workers = st.slider("Max Concurrent Workers", min_value=1, max_value=8, value=3)
+
+    if not pending_items:
+        st.info("No pending items in the queue. Add URLs above to begin.")
+        return
+
+    if st.button(f"🚀 Process {len(pending_items)} Pending Item(s)", type="primary"):
+        progress_bar = st.progress(0.0)
+        status_container = st.empty()
+        csv_lock = threading.Lock()
+        counter = {"success": 0, "fail": 0, "completed": 0}
+        total = len(pending_items)
+
+        def process_one(url: str) -> None:
+            try:
+                update_queue_status(url, 'Processing')
+                result = scraper.scrape_product(url)
+                if result.success and result.product_data:
+                    folder_path = file_manager.create_product_folder(
+                        brand=result.product_data.brand,
+                        item_id=result.product_data.item_id,
+                        fallback_title=result.product_data.title,
+                    )
+                    file_manager.save_product_description_markdown(result.product_data, folder_path)
+                    file_manager.save_product_text(result.product_data, folder_path)
+                    file_manager.save_raw_scrape_text(result.product_data, folder_path)
+                    if result.image_urls:
+                        file_manager.download_images(scraper, result.image_urls, folder_path)
+                    with csv_lock:
+                        append_to_local_csv(result.product_data)
+                    update_queue_status(url, 'Done')
+                    counter["success"] += 1
+                else:
+                    msg = (result.error_message or 'Unknown error')[:200]
+                    update_queue_status(url, 'Error', error=msg)
+                    counter["fail"] += 1
+            except Exception as e:
+                logger.error(f"Batch worker error on {url}: {traceback.format_exc()}")
+                update_queue_status(url, 'Error', error=str(e)[:200])
+                counter["fail"] += 1
+            finally:
+                counter["completed"] += 1
+
+        urls_to_process = [it['url'] for it in pending_items]
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(process_one, u) for u in urls_to_process]
+            while not all(f.done() for f in futures):
+                progress_bar.progress(counter["completed"] / total)
+                status_container.info(
+                    f"Completed: {counter['completed']}/{total} | "
+                    f"Success: {counter['success']} | Failed: {counter['fail']}"
+                )
+                time.sleep(0.5)
+            progress_bar.progress(1.0)
+            status_container.success(
+                f"Batch Finished! Success: {counter['success']}, Failed: {counter['fail']}"
+            )
+
+        # Reload persisted queue to reflect statuses
+        st.session_state.batch_queue = load_batch_queue()
+        st.toast("Batch processing completed!", icon="🎉")
+        time.sleep(1.5)
+        st.rerun()
+
+
+# =============================================================================
+# IMAGE FORMAT CONVERSION HELPERS
+# =============================================================================
+
+WEBP_TARGET_FORMATS = {
+    "PNG":  {"ext": ".png",  "pillow": "PNG",  "save_kwargs": {}},
+    "JPG":  {"ext": ".jpg",  "pillow": "JPEG", "save_kwargs": {"quality": 95, "subsampling": 0, "optimize": True}},
+    "JPEG": {"ext": ".jpeg", "pillow": "JPEG", "save_kwargs": {"quality": 95, "subsampling": 0, "optimize": True}},
+    "BMP":  {"ext": ".bmp",  "pillow": "BMP",  "save_kwargs": {}},
+    "TIFF": {"ext": ".tiff", "pillow": "TIFF", "save_kwargs": {}},
+}
+
+
+def list_folders_with_webp(base_dir: Path) -> List[Path]:
+    """Return subfolders of base_dir (recursive, depth-1 then nested) that contain .webp files."""
+    results: List[Path] = []
+    if not base_dir.exists():
+        return results
+    seen: set = set()
+
+    def has_webp(p: Path) -> bool:
+        try:
+            return any(child.is_file() and child.suffix.lower() == '.webp' for child in p.iterdir())
+        except Exception:
+            return False
+
+    if has_webp(base_dir) and base_dir not in seen:
+        results.append(base_dir)
+        seen.add(base_dir)
+
+    for path in base_dir.rglob('*'):
+        if path.is_dir() and path not in seen and has_webp(path):
+            results.append(path)
+            seen.add(path)
+
+    return sorted(results, key=lambda p: str(p).lower())
+
+
+def convert_webp_in_folder(folder: Path, target_key: str) -> Tuple[int, int, List[str]]:
+    """Convert every .webp in `folder` to target_key format, replacing the original.
+
+    Returns: (converted_count, failed_count, error_messages).
+    """
+    cfg = WEBP_TARGET_FORMATS[target_key]
+    converted = 0
+    failed = 0
+    errors: List[str] = []
+    for img_path in list(folder.iterdir()):
+        if not (img_path.is_file() and img_path.suffix.lower() == '.webp'):
+            continue
+        try:
+            with Image.open(img_path) as im:
+                save_im = im
+                if cfg["pillow"] == "JPEG" and save_im.mode in ("RGBA", "LA", "P"):
+                    save_im = save_im.convert("RGB")
+                elif cfg["pillow"] == "BMP" and save_im.mode == "RGBA":
+                    save_im = save_im.convert("RGB")
+                target_path = img_path.with_suffix(cfg["ext"])
+                save_im.save(target_path, format=cfg["pillow"], **cfg["save_kwargs"])
+            img_path.unlink(missing_ok=True)
+            converted += 1
+        except Exception as e:
+            failed += 1
+            errors.append(f"{img_path.name}: {e}")
+            logger.warning(f"WebP conversion failed for {img_path}: {e}")
+    return converted, failed, errors
+
+
+def render_image_format_tab(file_manager: "FileManager") -> None:
+    """Tab to bulk-convert .webp files in a chosen folder to another format."""
+    st.markdown(
+        """
+        <div style='margin-bottom: 1.5rem;'>
+            <h2 style='color: #000000; font-size: 1.75rem; font-weight: 700; margin-bottom: 0.25rem;'>Image Format</h2>
+            <p style='color: #6b7280; font-size: 1rem; margin: 0;'>Convert WebP images in a downloaded product folder to another format. Originals are replaced.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    base_dir = file_manager.base_dir
+    folders = list_folders_with_webp(base_dir)
+
+    if not folders:
+        st.info(f"No folders containing WebP images found under `{base_dir}`. Scrape some products first.")
+        return
+
+    folder_labels = [f"{p.relative_to(base_dir)} ({sum(1 for c in p.iterdir() if c.is_file() and c.suffix.lower() == '.webp')} webp)"
+                     if p != base_dir else f"(root) ({sum(1 for c in p.iterdir() if c.is_file() and c.suffix.lower() == '.webp')} webp)"
+                     for p in folders]
+
+    col_f, col_t = st.columns([2, 1])
+    with col_f:
+        idx = st.selectbox(
+            "Select folder (only folders with WebP images are listed)",
+            options=list(range(len(folders))),
+            format_func=lambda i: folder_labels[i],
+        )
+    with col_t:
+        target = st.selectbox("Convert to", options=list(WEBP_TARGET_FORMATS.keys()), index=0)
+
+    selected_folder = folders[idx]
+    webp_files = [p for p in selected_folder.iterdir() if p.is_file() and p.suffix.lower() == '.webp']
+    st.caption(f"Folder: `{selected_folder}` — found **{len(webp_files)}** webp file(s).")
+
+    if webp_files:
+        with st.expander("Preview files to be converted", expanded=False):
+            for wp in webp_files[:50]:
+                st.text(wp.name)
+            if len(webp_files) > 50:
+                st.caption(f"...and {len(webp_files) - 50} more")
+
+    if st.button(f"🔁 Convert {len(webp_files)} WebP → {target}", type="primary", disabled=not webp_files):
+        with st.spinner("Converting..."):
+            converted, failed, errors = convert_webp_in_folder(selected_folder, target)
+        if converted:
+            st.success(f"✅ Converted {converted} image(s) to {target}. Originals removed.")
+        if failed:
+            st.error(f"❌ {failed} image(s) failed to convert.")
+            with st.expander("Show errors"):
+                for err in errors:
+                    st.code(err, language=None)
+        if not converted and not failed:
+            st.info("Nothing to convert.")
+        st.rerun()
 
 def show_success_animation(message: str, icon: str = "✅"):
     """Display an animated success message."""
@@ -3684,19 +3532,14 @@ def inject_global_styles() -> None:
         unsafe_allow_html=True,
     )
 
-def initialize_components() -> Tuple[EbayScraper, GoogleSheetsManager, FileManager]:
+def initialize_components() -> Tuple[EbayScraper, FileManager]:
     """Initialize all application components."""
     scraper = EbayScraper()
-    
-    credentials = load_credentials()
-    sheets_manager = GoogleSheetsManager(credentials)
-    
     file_manager = FileManager()
-    
-    return scraper, sheets_manager, file_manager
+    return scraper, file_manager
 
-def display_scraping_results(result: ScrapingResult, downloaded_images: List[str], 
-                           folder_path: Path, sheets_updated: bool, csv_updated: bool):
+def display_scraping_results(result: ScrapingResult, downloaded_images: List[str],
+                           folder_path: Path, csv_updated: bool):
     """
     Display results of scraping operation with a premium specific product card layout.
     """
@@ -3723,11 +3566,6 @@ def display_scraping_results(result: ScrapingResult, downloaded_images: List[str
     badges_html = ""
     badges_html += f'<span class="status-badge">Images: {len(downloaded_images)}</span>'
     
-    if sheets_updated:
-        badges_html += '<span class="status-badge">Sheet: Updated</span>'
-    else:
-        badges_html += '<span class="status-badge neutral">Sheet: Skipped</span>'
-        
     if csv_updated:
         badges_html += '<span class="status-badge">CSV: Saved</span>'
     else:
@@ -3812,7 +3650,7 @@ def display_scraping_results(result: ScrapingResult, downloaded_images: List[str
                 st.warning("Could not open folder automatically.")
 
 
-def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manager: FileManager, sheets_manager: GoogleSheetsManager):
+def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manager: FileManager):
     """
     Orchestrates the single product scraping flow.
     """
@@ -3827,13 +3665,7 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
         st.error(f"❌ URL Validation Error: {e}")
         return
 
-    # 2. Check Duplicates (if Sheets active)
-    if sheets_manager.is_available():
-        if sheets_manager.url_exists(ebay_url):
-            st.warning("⚠️ This product is already in your Google Sheet. Skipping to maintain data integrity.")
-            return
-
-    # 3. Operations
+    # 2. Operations
     progress_bar = st.progress(0)
     status_msg = st.empty()
     
@@ -3853,7 +3685,11 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
         status_msg.markdown("**📁 Setting up project workspace...**")
         
         # FSYSOPS
-        folder_path = file_manager.create_product_folder(result.product_data.title, result.product_data.item_id)
+        folder_path = file_manager.create_product_folder(
+            brand=result.product_data.brand,
+            item_id=result.product_data.item_id,
+            fallback_title=result.product_data.title,
+        )
         result.folder_path = str(folder_path)
         
         file_manager.save_product_description_markdown(result.product_data, folder_path)
@@ -3873,22 +3709,7 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
             downloaded_images = downloaded
         
         progress_bar.progress(85)
-        status_msg.markdown("**📊 Updating databases...**")
-        
-        # DATABASE
-        sheets_updated = False
-        csv_updated = False
-        
-        # Sheets
-        if sheets_manager.is_available() and not getattr(sheets_manager, 'quota_exceeded', False):
-            try:
-                sheets_updated = sheets_manager.append_to_ebay_product_list(result.product_data)
-                if not sheets_updated:
-                    sheets_updated = sheets_manager.append_product_data(result.product_data)
-                # Status update
-                sheets_manager.update_status_by_url(result.product_data.url, status="Done")
-            except Exception as e:
-                logger.error(f"Sheets update error: {e}")
+        status_msg.markdown("**📊 Saving to local CSV...**")
 
         # CSV
         csv_updated = append_to_local_csv(result.product_data)
@@ -3898,9 +3719,9 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
         time.sleep(1)
         status_msg.empty() # Clear status
         progress_bar.empty() # Clear progress
-        
+
         # DISPLAY
-        display_scraping_results(result, downloaded_images, folder_path, sheets_updated, csv_updated)
+        display_scraping_results(result, downloaded_images, folder_path, csv_updated)
         
         # Confetti
         st.balloons()
@@ -3922,22 +3743,17 @@ def main():
     
     # Initialize components
     try:
-        scraper, sheets_manager, file_manager = initialize_components()
+        scraper, file_manager = initialize_components()
     except Exception as e:
         st.error(f"❌ Failed to initialize application: {e}")
         return
-    
+
     # Sidebar configuration
     with st.sidebar:
         st.header("Configuration")
-        
-        # Google Sheets status
-        if sheets_manager.is_available() and not getattr(sheets_manager, 'quota_exceeded', False):
-            st.success("Google Sheets connected")
-        else:
 
-            st.info("Google Sheets unavailable (quota or connection). Using CSV only.")
-        
+        st.info("Storage: Local CSV (EbayStore_Products.csv)")
+
         # Groq API configuration
         st.subheader("AI Processing")
         stored_key = load_groq_api_key()
@@ -3960,7 +3776,7 @@ def main():
             st.info("Add API key for AI features")
     
     # Main application tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Single Product", "Batch Processing", "AI Processing", "Image Enhancement", "Logs"])
+    tab1, tab2, tab3, tab4, tab_fmt, tab5 = st.tabs(["Single Product", "Batch Processing", "AI Processing", "Image Enhancement", "Image Format", "Logs"])
     
     # Tab 1: Single Product Scraping
     with tab1:
@@ -3988,7 +3804,7 @@ def main():
             )
             
         if scrape_button:
-            handle_single_product_scrape(ebay_url, scraper, file_manager, sheets_manager)
+            handle_single_product_scrape(ebay_url, scraper, file_manager)
             
         # Recent/Footer info or features could go here
         st.write("")
@@ -4001,258 +3817,7 @@ def main():
     
     # Tab 2: Batch Processing
     with tab2:
-        st.subheader("Batch Processing Operations")
-        
-        if not sheets_manager.is_available():
-            st.warning("Google Sheets integration not available. Please configure service account credentials.")
-            st.stop()
-        
-        # --- Batch Queue Status ---
-        col_status_1, col_status_2 = st.columns([3, 1])
-        with col_status_1:
-            st.info("ℹ️ The batch queue is managed via your Google Sheet (**ebay_Product_List**). Rows with empty Status are processed.")
-        with col_status_2:
-            if st.button("🔄 Refresh Queue"):
-                st.rerun()
-
-        # --- Add New Items Section ---
-        st.markdown("---")
-        st.markdown("### 📥 Add Links to Batch")
-        
-        input_tab1, input_tab2 = st.tabs(["📁 File Upload (CSV/Excel)", "📝 Manual Paste"])
-        
-        new_urls_to_add = []
-        source_note = "Batch Import"
-        
-        with input_tab1:
-            uploaded_file = st.file_uploader("Upload File", type=['csv', 'xlsx', 'xls'], help="Upload a list of URLs")
-            if uploaded_file:
-                try:
-                    df = None
-                    if uploaded_file.name.endswith('.csv'):
-                        df = pd.read_csv(uploaded_file)
-                    else:
-                        df = pd.read_excel(uploaded_file)
-                    
-                    if df is not None:
-                        # Smart column detection
-                        possible_cols = [c for c in df.columns if any(x in str(c).lower() for x in ['url', 'link', 'ebay', 'website'])]
-                        target_col = possible_cols[0] if possible_cols else df.columns[0]
-                        
-                        st.caption(f"Reading URLs from column: `{target_col}`")
-                        
-                        raw_urls = df[target_col].dropna().astype(str).tolist()
-                        new_urls_to_add.extend(raw_urls)
-                        source_note = f"Import: {uploaded_file.name}"
-                        
-                except Exception as e:
-                    st.error(f"Error reading file: {e}")
-
-        with input_tab2:
-            pasted_text = st.text_area("Paste eBay URLs (one per line)", height=200, placeholder="https://www.ebay.com/itm/...\nhttps://www.ebay.com/itm/...")
-            if pasted_text:
-                lines = [l.strip() for l in pasted_text.split('\n') if l.strip()]
-                new_urls_to_add.extend(lines)
-                if not source_note.startswith("Import"):
-                    source_note = "Manual Paste"
-
-        # --- Validation & Submission ---
-        if new_urls_to_add:
-            # Validate
-            valid_urls = []
-            for u in new_urls_to_add:
-                # Basic cleaning
-                u = u.strip()
-                if u and scraper.validate_ebay_url(u):
-                    valid_urls.append(u)
-            
-            # Deduplicate locally
-            valid_urls = list(dict.fromkeys(valid_urls))
-            
-            if valid_urls:
-                st.success(f"✅ Found {len(valid_urls)} valid eBay URLs ready to add.")
-                
-                if st.button(f"➕ Add {len(valid_urls)} Items to Queue", type="primary"):
-                    try:
-                        _, sheet_ws = sheets_manager.ensure_spreadsheet_and_worksheet(title='ebay_Product_List', worksheet_name='ebay_Product_List')
-                        if sheet_ws:
-                            # Get existing to prevent duplicates
-                            existing_urls = set()
-                            try:
-                                all_vals = sheet_ws.get_all_values()
-                                existing_urls = set(str(r).lower() for row in all_vals for r in row)
-                            except: pass
-                            
-                            rows_to_add = []
-                            h_map = sheets_manager._get_header_map(sheet_ws)
-                            
-                            # Determine column indices
-                            col_url = h_map.get('ebayurl', h_map.get('url', 0))
-                            col_status = h_map.get('status', 1)
-                            col_notes = h_map.get('notes', 2)
-                            
-                            max_idx = max(col_url, col_status, col_notes, max(h_map.values()) if h_map else 5)
-                            
-                            added_count = 0
-                            for url in valid_urls:
-                                if url.lower() not in existing_urls:
-                                    row = [''] * (max_idx + 1)
-                                    row[col_url] = url
-                                    row[col_status] = 'Pending'
-                                    if col_notes: row[col_notes] = source_note
-                                    
-                                    rows_to_add.append(row)
-                                    existing_urls.add(url.lower())
-                                    added_count += 1
-                            
-                            if rows_to_add:
-                                sheet_ws.append_rows(rows_to_add)
-                                st.balloons()
-                                st.toast(f"Added {added_count} new items to the batch queue!", icon="🚀")
-                                time.sleep(1.5)
-                                st.rerun()
-                            else:
-                                st.warning("All provided URLs are already in the batch list.")
-                                
-                    except Exception as e:
-                        st.error(f"Failed to add to sheet: {e}")
-            else:
-                st.warning("No valid eBay URLs found in input.")
-
-        # --- Processing Section ---
-        st.markdown("---")
-        st.markdown("### ⚙️ Processing Control")
-        
-        max_workers = st.slider("Max Concurrent Workers", min_value=1, max_value=8, value=3)
-        
-        # Check for pending items - use session state caching to avoid rate limits
-        if 'pending_items_cache' not in st.session_state:
-            st.session_state.pending_items_cache = []
-            st.session_state.pending_items_last_fetch = 0
-        
-        pending_items = st.session_state.pending_items_cache
-        
-        # Only fetch from sheet when Refresh button is clicked
-        col_refresh, col_info = st.columns([1, 3])
-        with col_refresh:
-            refresh_clicked = st.button("🔄 Refresh Queue", type="primary")
-        with col_info:
-            if st.session_state.pending_items_last_fetch:
-                last_fetch_time = time.strftime('%H:%M:%S', time.localtime(st.session_state.pending_items_last_fetch))
-                st.caption(f"Last refreshed: {last_fetch_time}")
-        
-        if refresh_clicked:
-            try:
-                _, sheet_worksheet = sheets_manager.ensure_spreadsheet_and_worksheet(title='ebay_Product_List', worksheet_name='ebay_Product_List', allow_create=False)
-                if sheet_worksheet:
-                    all_vals = sheet_worksheet.get_all_values()
-                    pending_items = []
-                    if len(all_vals) > 1:
-                        header = all_vals[0]
-                        # Simple mapper
-                        h_map_clean = {k.lower().strip(): i for i, k in enumerate(header)}
-                        u_idx = next((v for k, v in h_map_clean.items() if k in ['ebayurl', 'ebay_url', 'url', 'link']), None)
-                        s_idx = next((v for k, v in h_map_clean.items() if k == 'status'), None)
-                        
-                        if u_idx is not None:
-                            for i, row in enumerate(all_vals[1:]):
-                                if len(row) > u_idx:
-                                    u = row[u_idx]
-                                    s = row[s_idx] if s_idx is not None and len(row) > s_idx else ''
-                                    if u and scraper.validate_ebay_url(u) and (not s or s.lower() in ['pending', '']):
-                                        pending_items.append({'row': i + 2, 'url': u})
-                    
-                    # Cache the results
-                    st.session_state.pending_items_cache = pending_items
-                    st.session_state.pending_items_last_fetch = time.time()
-                    st.toast(f"Found {len(pending_items)} pending items!", icon="✅")
-            except Exception as e:
-                st.error(f"Error fetching pending items: {e}")
-
-        st.metric("Pending Items in Queue", len(pending_items))
-
-        # Process Button
-        if pending_items:
-            if st.button(f"🚀 Process {len(pending_items)} Items (Concurrent)", type="primary"):
-                progress_container = st.container()
-                status_container = st.empty()
-                stop_event = threading.Event()
-                stop_button = st.button("Stop Batch")
-                
-                # Sheet lock
-                sheet_lock = threading.Lock()
-                
-                results_counter = {"success": 0, "fail": 0, "completed": 0}
-                
-                def process_url(item):
-                    if stop_event.is_set(): return
-                    
-                    url = item['url']
-                    try:
-                        # 1. Update status to Processing (Thread safe?) 
-                        # Ideally we batch updates or just do it optimistically. 
-                        # For speed, skip the 'Processing' update or do it if low volume.
-                        
-                        # 2. Scrape
-                        result = scraper.scrape_product(url)
-                        
-                        if result.success:
-                            # 3. Save Data (File ops are generally thread safe if different folders)
-                            folder_path = file_manager.create_product_folder(result.product_data.title, result.product_data.item_id)
-                            file_manager.save_product_description_markdown(result.product_data, folder_path)
-                            file_manager.save_product_text(result.product_data, folder_path)
-                            file_manager.save_raw_scrape_text(result.product_data, folder_path)
-                            
-                            file_manager.download_images(scraper, result.image_urls, folder_path)
-                            
-                            # 4. Update Sheet & CSV (Critical Section)
-                            with sheet_lock:
-                                # Update the existing row with all product data
-                                sheets_manager.update_row_with_product_data(url, result.product_data)
-                                append_to_local_csv(result.product_data)
-                                results_counter["success"] += 1
-                        else:
-                            with sheet_lock:
-                                sheets_manager.update_status_by_url(url, f"Error: {result.error_message}")
-                                results_counter["fail"] += 1
-                                
-                    except Exception as e:
-                        logger.error(f"Batch worker error on {url}: {e}")
-                        with sheet_lock:
-                             try:
-                                 sheets_manager.update_status_by_url(url, "Error: Exception")
-                             except: pass
-                             results_counter["fail"] += 1
-                    finally:
-                        results_counter["completed"] += 1
-                        
-                # Progress Bar Logic
-                progress_bar = progress_container.progress(0.0)
-                
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = [executor.submit(process_url, item) for item in pending_items]
-                    
-                    # Monitor loop
-                    while not all(f.done() for f in futures):
-                        if stop_button:
-                            stop_event.set()
-                            executor.shutdown(wait=False, cancel_futures=True)
-                            st.warning("Stopping...")
-                            break
-                        
-                        progress = results_counter["completed"] / len(pending_items)
-                        progress_bar.progress(progress)
-                        status_container.info(f"Completed: {results_counter['completed']}/{len(pending_items)} | Success: {results_counter['success']} | Failed: {results_counter['fail']}")
-                        time.sleep(0.5)
-                        
-                    # Final update
-                    progress_bar.progress(1.0)
-                    status_container.success(f"Batch Finished! Success: {results_counter['success']}, Failed: {results_counter['fail']}")
-                    st.toast("Batch processing completed!", icon="🎉")
-                    time.sleep(2)
-                    st.rerun()
-        else:
-            st.info("No pending items found in the sheet.")
+        render_batch_tab(scraper, file_manager)
     
     # Tab 3: AI Enhancement
     with tab3:
@@ -5146,6 +4711,10 @@ def main():
                 except Exception as e:
                     st.error(f"❌ Image enhancement error: {e}")
                     logger.error(f"Image enhancement error: {traceback.format_exc()}")
+
+    # Tab: Image Format (WebP conversion)
+    with tab_fmt:
+        render_image_format_tab(file_manager)
 
     # Tab 5: Logs
     with tab5:
