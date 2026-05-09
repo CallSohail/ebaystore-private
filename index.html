@@ -1,0 +1,1383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>eBay Scraper Pro · Web</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  :root { --accent:#111827; --accent-2:#374151; --line:#e5e7eb; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; color:#111827; background:#fafafa; }
+  .tab-btn { padding: 0.6rem 1rem; border-bottom: 2px solid transparent; color:#6b7280; font-weight:500; cursor:pointer; white-space:nowrap; }
+  .tab-btn.active { color:#111827; border-color:#111827; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:12px; padding:1.25rem; }
+  .btn { display:inline-flex; align-items:center; justify-content:center; gap:.5rem; padding:.55rem 1rem; border-radius:8px; font-weight:600; cursor:pointer; border:1px solid var(--line); background:#fff; transition:all .15s; }
+  .btn:hover { background:#f3f4f6; }
+  .btn-primary { background:#111827; color:#fff; border-color:#111827; }
+  .btn-primary:hover { background:#1f2937; }
+  .btn-danger { background:#fff; color:#b91c1c; border-color:#fecaca; }
+  .btn-danger:hover { background:#fef2f2; }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  input[type=text], input[type=password], input[type=number], textarea, select {
+    width:100%; padding:.55rem .75rem; border:1px solid var(--line); border-radius:8px; background:#fff; outline:none;
+  }
+  input:focus, textarea:focus, select:focus { border-color:#111827; box-shadow:0 0 0 3px rgba(17,24,39,.07); }
+  .badge { display:inline-block; padding:.15rem .55rem; border-radius:999px; font-size:.72rem; font-weight:600; }
+  .badge-pending { background:#fef3c7; color:#92400e; }
+  .badge-processing { background:#dbeafe; color:#1e40af; }
+  .badge-done { background:#d1fae5; color:#065f46; }
+  .badge-error { background:#fee2e2; color:#991b1b; }
+  .table { width:100%; border-collapse:collapse; font-size:.875rem; }
+  .table th, .table td { text-align:left; padding:.6rem .75rem; border-bottom:1px solid var(--line); vertical-align:top; }
+  .table th { background:#f9fafb; font-weight:600; font-size:.75rem; text-transform:uppercase; letter-spacing:.04em; color:#6b7280; }
+  .slider { -webkit-appearance:none; appearance:none; width:100%; height:6px; border-radius:3px; background:#e5e7eb; outline:none; }
+  .slider::-webkit-slider-thumb { -webkit-appearance:none; width:18px; height:18px; border-radius:50%; background:#111827; cursor:pointer; }
+  .slider::-moz-range-thumb { width:18px; height:18px; border-radius:50%; background:#111827; cursor:pointer; border:none; }
+  .toast { position:fixed; bottom:1.25rem; right:1.25rem; background:#111827; color:#fff; padding:.75rem 1rem; border-radius:8px; z-index:9999; box-shadow:0 8px 24px rgba(0,0,0,.18); animation: slideUp .25s ease-out; }
+  @keyframes slideUp { from { transform: translateY(20px); opacity:0; } to { transform: translateY(0); opacity:1; } }
+  .log-line { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size:.78rem; padding:.15rem .35rem; border-radius:3px; }
+  .log-error { background:#fef2f2; color:#991b1b; }
+  .log-warn  { background:#fffbeb; color:#92400e; }
+  .log-info  { color:#374151; }
+  .log-debug { color:#9ca3af; }
+  .grid-thumbs { display:grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap:.5rem; }
+  .grid-thumbs img { width:100%; height:140px; object-fit:cover; border-radius:8px; border:1px solid var(--line); }
+  .chat-msg { padding:.75rem 1rem; border-radius:12px; margin-bottom:.5rem; max-width: 85%; }
+  .chat-user { background:#111827; color:#fff; margin-left:auto; }
+  .chat-ai { background:#f3f4f6; color:#111827; }
+  .pill { display:inline-flex; align-items:center; gap:.25rem; padding:.2rem .55rem; border-radius:999px; background:#f3f4f6; color:#374151; font-size:.72rem; font-weight:500; }
+  details > summary { cursor:pointer; }
+  .hidden-scroll::-webkit-scrollbar { display:none; }
+  .hidden-scroll { -ms-overflow-style:none; scrollbar-width:none; }
+</style>
+</head>
+<body class="min-h-screen">
+
+<!-- Header -->
+<header class="border-b border-gray-200 bg-white">
+  <div class="max-w-7xl mx-auto px-6 py-5 flex items-center justify-between">
+    <div>
+      <h1 class="text-2xl font-bold tracking-tight">EBAY SCRAPER</h1>
+      <p class="text-xs text-gray-500 mt-0.5">Web edition · runs entirely in your browser</p>
+    </div>
+    <div class="flex items-center gap-2">
+      <span id="folderStatus" class="pill">📁 No folder picked</span>
+      <button class="btn" onclick="openSettings()">⚙️ Settings</button>
+    </div>
+  </div>
+</header>
+
+<!-- Tabs -->
+<nav class="border-b border-gray-200 bg-white sticky top-0 z-30">
+  <div class="max-w-7xl mx-auto px-6 flex gap-1 overflow-x-auto hidden-scroll">
+    <div class="tab-btn active" data-tab="single">Single Product</div>
+    <div class="tab-btn" data-tab="batch">Batch Processing</div>
+    <div class="tab-btn" data-tab="ai">AI Processing</div>
+    <div class="tab-btn" data-tab="enhance">Image Enhancement</div>
+    <div class="tab-btn" data-tab="format">Image Format</div>
+    <div class="tab-btn" data-tab="logs">Logs</div>
+  </div>
+</nav>
+
+<main class="max-w-7xl mx-auto px-6 py-8 space-y-6">
+
+  <!-- SINGLE PRODUCT TAB -->
+  <section id="tab-single" class="tab-section">
+    <div class="card">
+      <h2 class="text-xl font-semibold mb-1">Find Product</h2>
+      <p class="text-sm text-gray-500 mb-4">Paste an eBay URL to extract data, download images, and append a row to your CSV.</p>
+      <div class="flex gap-2">
+        <input id="singleUrl" type="text" placeholder="https://www.ebay.com/itm/123456789" />
+        <button class="btn btn-primary whitespace-nowrap" onclick="handleSingleScrape()">▶ Scrape</button>
+      </div>
+      <p class="text-xs text-gray-500 mt-2">Save folder: <span id="singleFolderHint" class="font-mono">(not picked – use Settings)</span></p>
+    </div>
+
+    <div id="singleResults" class="mt-6"></div>
+  </section>
+
+  <!-- BATCH TAB -->
+  <section id="tab-batch" class="tab-section hidden">
+    <div class="card">
+      <h2 class="text-xl font-semibold mb-1">Batch Processing</h2>
+      <p class="text-sm text-gray-500 mb-4">Queue is stored in your browser (<code>localStorage</code>). Scraped data appends to a downloadable CSV.</p>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium mb-1">Paste URLs (newlines, commas, semicolons; trailing commas OK)</label>
+          <textarea id="batchPaste" rows="6" placeholder="https://www.ebay.com/itm/1, https://www.ebay.com/itm/2,&#10;https://www.ebay.com/itm/3"></textarea>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">Or upload CSV (URLs auto-detected)</label>
+          <input id="batchFile" type="file" accept=".csv,text/csv" class="block w-full text-sm" />
+          <p class="text-xs text-gray-500 mt-1">For Excel files, please save as CSV first.</p>
+          <div class="mt-3">
+            <label class="block text-sm font-medium mb-1">Concurrent workers</label>
+            <input id="batchWorkers" type="number" min="1" max="6" value="3" />
+          </div>
+        </div>
+      </div>
+
+      <div class="flex gap-2 mt-4 flex-wrap">
+        <button class="btn btn-primary" onclick="addToBatchQueue()">➕ Add to Queue</button>
+        <button class="btn" onclick="processBatchQueue()">🚀 Process Pending</button>
+        <button class="btn" onclick="resetErrorsToPending()">🔄 Reset Errors</button>
+        <button class="btn btn-danger" onclick="clearDoneQueue()">🗑️ Clear Done</button>
+        <button class="btn btn-danger" onclick="clearAllQueue()">❌ Clear All</button>
+        <button class="btn" onclick="exportQueueCsv()">⬇️ Export Queue CSV</button>
+      </div>
+
+      <div class="grid grid-cols-4 gap-3 mt-5">
+        <div class="card !p-3 text-center"><div class="text-xs text-gray-500">Total</div><div id="qTotal" class="text-2xl font-bold">0</div></div>
+        <div class="card !p-3 text-center"><div class="text-xs text-gray-500">Pending</div><div id="qPending" class="text-2xl font-bold">0</div></div>
+        <div class="card !p-3 text-center"><div class="text-xs text-gray-500">Done</div><div id="qDone" class="text-2xl font-bold">0</div></div>
+        <div class="card !p-3 text-center"><div class="text-xs text-gray-500">Errors</div><div id="qErrors" class="text-2xl font-bold">0</div></div>
+      </div>
+
+      <div id="batchProgress" class="mt-4 hidden">
+        <div class="w-full h-2 bg-gray-200 rounded-full overflow-hidden">
+          <div id="batchBar" class="h-full bg-gray-900" style="width:0%"></div>
+        </div>
+        <p id="batchStatus" class="text-xs text-gray-600 mt-1.5"></p>
+      </div>
+
+      <div class="mt-5 overflow-x-auto">
+        <table class="table">
+          <thead><tr><th>URL</th><th>Status</th><th>Note</th><th>Updated</th><th>Error</th></tr></thead>
+          <tbody id="queueBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- AI TAB -->
+  <section id="tab-ai" class="tab-section hidden">
+    <div class="card">
+      <h2 class="text-xl font-semibold mb-1">AI Processing (Groq)</h2>
+      <p class="text-sm text-gray-500 mb-4">Set your Groq API key in Settings. Picks one of your scraped products as context.</p>
+
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div class="md:col-span-1">
+          <label class="block text-sm font-medium mb-1">Product context</label>
+          <select id="aiProductSelect"></select>
+          <label class="block text-sm font-medium mt-3 mb-1">Model</label>
+          <select id="aiModel">
+            <option value="llama-3.3-70b-versatile">llama-3.3-70b-versatile</option>
+            <option value="llama-3.1-8b-instant">llama-3.1-8b-instant</option>
+            <option value="openai/gpt-oss-20b">openai/gpt-oss-20b</option>
+          </select>
+          <label class="block text-sm font-medium mt-3 mb-1">Platform style</label>
+          <select id="aiPlatform">
+            <option value="ebay">eBay (SEO-optimized)</option>
+            <option value="amazon">Amazon</option>
+            <option value="shopify">Shopify</option>
+            <option value="instagram">Instagram</option>
+          </select>
+          <button class="btn btn-primary mt-3 w-full" onclick="generateAIDescription()">✨ Generate Description</button>
+        </div>
+        <div class="md:col-span-2">
+          <label class="block text-sm font-medium mb-1">Output</label>
+          <textarea id="aiOutput" rows="14" placeholder="AI output will appear here..."></textarea>
+          <div class="flex gap-2 mt-2">
+            <button class="btn" onclick="copyAIOutput()">📋 Copy</button>
+            <button class="btn" onclick="downloadAIOutput()">⬇️ Download .md</button>
+          </div>
+        </div>
+      </div>
+
+      <hr class="my-6 border-gray-200" />
+
+      <h3 class="font-semibold mb-2">💬 Chat Assistant</h3>
+      <div id="chatBox" class="space-y-2 max-h-80 overflow-y-auto p-3 bg-gray-50 rounded-lg border border-gray-200"></div>
+      <div class="flex gap-2 mt-3">
+        <input id="chatInput" type="text" placeholder="Ask anything about the selected product..." onkeydown="if(event.key==='Enter')sendChat()" />
+        <button class="btn btn-primary" onclick="sendChat()">Send</button>
+        <button class="btn" onclick="clearChat()">Clear</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- IMAGE ENHANCEMENT TAB -->
+  <section id="tab-enhance" class="tab-section hidden">
+    <div class="card">
+      <h2 class="text-xl font-semibold mb-1">Image Enhancement</h2>
+      <p class="text-sm text-gray-500 mb-4">Upload images, adjust enhancements, optionally overlay a logo, then download or save back to a folder.</p>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium mb-1">Pick images</label>
+          <input id="enhInput" type="file" accept="image/*" multiple class="block w-full text-sm" />
+          <p class="text-xs text-gray-500 mt-1">Or pick a folder via Settings, then click "Load from folder".</p>
+          <button class="btn mt-2" onclick="loadImagesFromFolder()">📂 Load from picked folder</button>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">Logo (optional)</label>
+          <input id="logoInput" type="file" accept="image/*" class="block w-full text-sm" />
+          <img id="logoPreview" class="h-12 mt-2 hidden" />
+        </div>
+      </div>
+
+      <h3 class="font-semibold mt-6 mb-2">⚡ Quick Presets</h3>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
+        <button class="btn" onclick="applyPreset('ebay')">🛒 eBay Ready</button>
+        <button class="btn" onclick="applyPreset('instagram')">📸 Instagram</button>
+        <button class="btn" onclick="applyPreset('pro')">✨ Professional</button>
+        <button class="btn" onclick="applyPreset('reset')">🔄 Reset</button>
+      </div>
+
+      <h3 class="font-semibold mt-6 mb-2">🎨 Fine-tune</h3>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div><label class="text-xs text-gray-600">Brightness <span id="vBrightness">1.05</span></label><input id="brightness" type="range" min="0.1" max="2.5" step="0.01" value="1.05" class="slider" /></div>
+        <div><label class="text-xs text-gray-600">Contrast <span id="vContrast">1.10</span></label><input id="contrast" type="range" min="0.1" max="2.5" step="0.01" value="1.10" class="slider" /></div>
+        <div><label class="text-xs text-gray-600">Sharpness <span id="vSharpness">1.10</span></label><input id="sharpness" type="range" min="0" max="3" step="0.01" value="1.10" class="slider" /></div>
+        <div><label class="text-xs text-gray-600">Saturation <span id="vSaturation">1.05</span></label><input id="saturation" type="range" min="0.1" max="2.5" step="0.01" value="1.05" class="slider" /></div>
+      </div>
+
+      <h3 class="font-semibold mt-6 mb-2">🏷️ Logo Watermark</h3>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div><label class="text-xs text-gray-600">Size ratio <span id="vLogoRatio">0.15</span></label><input id="logoRatio" type="range" min="0.02" max="0.4" step="0.01" value="0.15" class="slider" /></div>
+        <div><label class="text-xs text-gray-600">Margin (px) <span id="vLogoMargin">10</span></label><input id="logoMargin" type="range" min="0" max="200" step="1" value="10" class="slider" /></div>
+        <div><label class="text-xs text-gray-600">Opacity <span id="vLogoOpacity">1.0</span></label><input id="logoOpacity" type="range" min="0.1" max="1" step="0.05" value="1" class="slider" /></div>
+        <div><label class="text-xs text-gray-600">Position</label>
+          <select id="logoPosition">
+            <option value="bottom-right">Bottom-right</option>
+            <option value="bottom-left">Bottom-left</option>
+            <option value="top-right">Top-right</option>
+            <option value="top-left">Top-left</option>
+            <option value="center">Center</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="flex gap-2 mt-5 flex-wrap">
+        <button class="btn btn-primary" onclick="enhancePreview()">👁️ Preview First</button>
+        <button class="btn btn-primary" onclick="enhanceAll()">🚀 Process All & Download</button>
+        <button class="btn" onclick="enhanceAll(true)">💾 Process All → Save to Folder</button>
+      </div>
+
+      <div id="enhResults" class="grid-thumbs mt-5"></div>
+    </div>
+  </section>
+
+  <!-- IMAGE FORMAT TAB -->
+  <section id="tab-format" class="tab-section hidden">
+    <div class="card">
+      <h2 class="text-xl font-semibold mb-1">Image Format</h2>
+      <p class="text-sm text-gray-500 mb-4">Convert WebP images to PNG / JPG / JPEG / BMP / GIF. Pick a folder (folders containing WebP files are auto-detected) or upload individual files.</p>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium mb-1">Source folder (with WebP)</label>
+          <select id="webpFolderSelect"></select>
+          <button class="btn mt-2" onclick="rescanWebpFolders()">🔍 Rescan folders</button>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">Or upload .webp files</label>
+          <input id="webpInput" type="file" accept="image/webp,.webp" multiple class="block w-full text-sm" />
+          <label class="block text-sm font-medium mt-3 mb-1">Convert to</label>
+          <select id="webpTarget">
+            <option value="png">PNG</option>
+            <option value="jpg" selected>JPG</option>
+            <option value="jpeg">JPEG</option>
+            <option value="bmp">BMP</option>
+            <option value="gif">GIF</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="flex gap-2 mt-4 flex-wrap">
+        <button class="btn btn-primary" onclick="convertWebpFolder()">🔁 Convert folder (replace originals)</button>
+        <button class="btn" onclick="convertWebpUploaded()">⬇️ Convert uploads & download</button>
+      </div>
+
+      <p id="webpStatus" class="text-sm text-gray-600 mt-3"></p>
+    </div>
+  </section>
+
+  <!-- LOGS TAB -->
+  <section id="tab-logs" class="tab-section hidden">
+    <div class="card">
+      <h2 class="text-xl font-semibold mb-1">System Logs</h2>
+      <div class="flex gap-2 mb-3">
+        <button class="btn" onclick="renderLogs()">🔄 Refresh</button>
+        <button class="btn" onclick="downloadLogs()">⬇️ Download</button>
+        <button class="btn btn-danger" onclick="clearLogs()">🗑️ Clear</button>
+      </div>
+      <div id="logBox" class="bg-gray-50 border border-gray-200 rounded-lg p-3 max-h-96 overflow-y-auto"></div>
+    </div>
+  </section>
+
+</main>
+
+<!-- SETTINGS MODAL -->
+<div id="settingsModal" class="fixed inset-0 bg-black/40 z-50 hidden flex items-center justify-center p-4" onclick="if(event.target===this)closeSettings()">
+  <div class="bg-white rounded-xl max-w-lg w-full p-6 shadow-xl">
+    <div class="flex justify-between items-center mb-4">
+      <h2 class="text-lg font-semibold">Settings</h2>
+      <button class="text-2xl text-gray-400 hover:text-gray-700" onclick="closeSettings()">&times;</button>
+    </div>
+
+    <div class="space-y-4">
+      <div>
+        <label class="block text-sm font-medium mb-1">Save folder</label>
+        <div class="flex gap-2">
+          <button class="btn flex-1" onclick="pickFolder()">📁 Pick folder</button>
+          <button class="btn" onclick="forgetFolder()" title="Forget picked folder">🗑️</button>
+        </div>
+        <p id="settingsFolderName" class="text-xs text-gray-500 mt-1.5">Not picked.</p>
+        <p class="text-xs text-gray-400 mt-1">Folder picker requires Chrome / Edge / Brave / Opera. Other browsers fall back to per-file downloads.</p>
+      </div>
+
+      <div>
+        <label class="block text-sm font-medium mb-1">CORS proxy URL</label>
+        <input id="corsProxy" type="text" />
+        <p class="text-xs text-gray-500 mt-1">Browser cannot fetch eBay directly. The proxy URL is prefixed to the target. Default: <code>https://corsproxy.io/?</code> · Alternatives: <code>https://api.allorigins.win/raw?url=</code></p>
+      </div>
+
+      <div>
+        <label class="block text-sm font-medium mb-1">Groq API key</label>
+        <input id="groqKey" type="password" placeholder="gsk_..." />
+        <p class="text-xs text-gray-500 mt-1">Stored only in your browser (<code>localStorage</code>).</p>
+      </div>
+    </div>
+
+    <div class="flex gap-2 mt-6">
+      <button class="btn btn-primary flex-1" onclick="saveSettings()">Save</button>
+      <button class="btn" onclick="closeSettings()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast container -->
+<div id="toastRoot"></div>
+
+<script>
+/* =========================================================================
+   eBay Scraper Pro – Web Edition
+   - Static HTML/JS port of the Streamlit app
+   - All work happens client-side; eBay fetches go through a CORS proxy
+   ========================================================================= */
+
+const STORAGE = {
+  settings: 'ebay_web_settings_v1',
+  queue:    'ebay_web_queue_v1',
+  results:  'ebay_web_results_v1',
+  logs:     'ebay_web_logs_v1',
+  chat:     'ebay_web_chat_v1',
+  csv:      'ebay_web_csv_v1',
+};
+
+const DEFAULT_SETTINGS = {
+  corsProxy: 'https://corsproxy.io/?',
+  groqKey: '',
+};
+
+let SETTINGS = loadJSON(STORAGE.settings, DEFAULT_SETTINGS);
+let QUEUE = loadJSON(STORAGE.queue, []);
+let RESULTS = loadJSON(STORAGE.results, []);   // [{url, title, brand, item_id, ...}]
+let LOGS = loadJSON(STORAGE.logs, []);
+let CHAT = loadJSON(STORAGE.chat, []);
+let CSV_ROWS = loadJSON(STORAGE.csv, []);
+let FOLDER_HANDLE = null;                       // FileSystemDirectoryHandle (in-memory only; persisted name via IDB below)
+let FOLDER_NAME = '';
+let LAST_ENHANCE_OUTPUTS = [];                  // [{name, blob}]
+let WEBP_FOLDER_LIST = [];                      // [{handle, name, count}]
+let UPLOADED_IMAGES = [];                       // [{name, blob}] for enhancement uploads
+let LOGO_BLOB = null;
+
+// ---------- Utilities ----------
+function loadJSON(key, fallback) {
+  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
+  catch (e) { return fallback; }
+}
+function saveJSON(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { log('error', 'localStorage write failed: ' + e.message); }
+}
+function nowStamp() {
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0')
+       + ' ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0') + ':' + String(d.getSeconds()).padStart(2,'0');
+}
+function log(level, msg) {
+  const entry = { ts: nowStamp(), level, msg: String(msg) };
+  LOGS.push(entry);
+  if (LOGS.length > 1000) LOGS.shift();
+  saveJSON(STORAGE.logs, LOGS);
+  if (document.getElementById('logBox') && document.querySelector('#tab-logs:not(.hidden)')) renderLogs();
+}
+function toast(msg, kind='') {
+  const t = document.createElement('div');
+  t.className = 'toast';
+  if (kind === 'error') t.style.background = '#b91c1c';
+  if (kind === 'success') t.style.background = '#065f46';
+  t.textContent = msg;
+  document.getElementById('toastRoot').appendChild(t);
+  setTimeout(() => t.remove(), 2800);
+}
+function safeFilename(s, maxLen=100) {
+  if (!s) return 'Unknown_Product';
+  return String(s).replace(/[<>:"\/\\|?*]+/g, '').replace(/\s+/g, ' ').trim().slice(0, maxLen) || 'Unknown_Product';
+}
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ---------- Tabs ----------
+document.querySelectorAll('.tab-btn').forEach(b => b.addEventListener('click', () => activateTab(b.dataset.tab)));
+function activateTab(name) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.tab-section').forEach(s => s.classList.toggle('hidden', s.id !== 'tab-' + name));
+  if (name === 'logs') renderLogs();
+  if (name === 'ai') refreshAIProductSelect();
+  if (name === 'batch') renderQueue();
+  if (name === 'format') rescanWebpFolders();
+}
+
+// ---------- Settings modal & folder picker ----------
+function openSettings() {
+  document.getElementById('corsProxy').value = SETTINGS.corsProxy || '';
+  document.getElementById('groqKey').value = SETTINGS.groqKey || '';
+  document.getElementById('settingsFolderName').textContent = FOLDER_HANDLE ? `Picked: ${FOLDER_NAME}` : 'Not picked.';
+  document.getElementById('settingsModal').classList.remove('hidden');
+}
+function closeSettings() { document.getElementById('settingsModal').classList.add('hidden'); }
+function saveSettings() {
+  SETTINGS.corsProxy = document.getElementById('corsProxy').value.trim() || DEFAULT_SETTINGS.corsProxy;
+  SETTINGS.groqKey = document.getElementById('groqKey').value.trim();
+  saveJSON(STORAGE.settings, SETTINGS);
+  toast('Settings saved', 'success');
+  closeSettings();
+  refreshFolderHints();
+}
+async function pickFolder() {
+  if (!('showDirectoryPicker' in window)) {
+    toast('Folder picker not supported in this browser. Use Chrome / Edge / Brave / Opera.', 'error');
+    return;
+  }
+  try {
+    const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+    FOLDER_HANDLE = handle;
+    FOLDER_NAME = handle.name;
+    document.getElementById('settingsFolderName').textContent = `Picked: ${FOLDER_NAME}`;
+    refreshFolderHints();
+    toast('Folder selected: ' + FOLDER_NAME, 'success');
+    log('info', 'Folder picked: ' + FOLDER_NAME);
+  } catch (e) {
+    if (e.name !== 'AbortError') log('error', 'pickFolder: ' + e.message);
+  }
+}
+function forgetFolder() {
+  FOLDER_HANDLE = null; FOLDER_NAME = '';
+  document.getElementById('settingsFolderName').textContent = 'Not picked.';
+  refreshFolderHints();
+}
+function refreshFolderHints() {
+  const lbl = FOLDER_HANDLE ? `📁 ${FOLDER_NAME}` : '📁 No folder picked';
+  document.getElementById('folderStatus').textContent = lbl;
+  document.getElementById('singleFolderHint').textContent = FOLDER_HANDLE ? FOLDER_NAME : '(not picked – use Settings; downloads will be ZIPed instead)';
+}
+
+// ---------- URL parsing & validation ----------
+function parseUrlInput(text) {
+  if (!text) return [];
+  const tokens = text.split(/[\s,;]+/);
+  const cleaned = [];
+  for (const tok of tokens) {
+    const t = tok.replace(/^['"]+|['"]+$/g, '').replace(/^[,;]+|[,;]+$/g, '').trim();
+    if (t) cleaned.push(t);
+  }
+  return cleaned;
+}
+function validateEbayUrl(url) {
+  try {
+    const u = new URL(url);
+    if (!/^https?:$/.test(u.protocol)) return false;
+    if (!/(^|\.)ebay\.[a-z.]+$/i.test(u.hostname)) return false;
+    return true;
+  } catch { return false; }
+}
+function extractItemIdFromUrl(url) {
+  try {
+    const u = new URL(url);
+    const m = u.pathname.match(/\/itm\/([^\/?#]+)/i);
+    if (m) {
+      const tail = m[1];
+      const digit = tail.match(/(\d{6,})/);
+      if (digit) return digit[1];
+    }
+    if (u.searchParams.get('itm')) return u.searchParams.get('itm');
+    if (u.searchParams.get('item')) return u.searchParams.get('item');
+  } catch {}
+  return '';
+}
+
+// ---------- eBay scraping (browser via CORS proxy) ----------
+async function fetchEbayHtml(url) {
+  const proxy = SETTINGS.corsProxy || DEFAULT_SETTINGS.corsProxy;
+  // Both common proxy styles take encoded URL appended; corsproxy.io & allorigins both accept this pattern.
+  const target = proxy + encodeURIComponent(url);
+  const resp = await fetch(target, { headers: { 'Accept': 'text/html' } });
+  if (!resp.ok) throw new Error('HTTP ' + resp.status);
+  return await resp.text();
+}
+function pickFirstText(doc, selectors) {
+  for (const sel of selectors) {
+    try {
+      const el = doc.querySelector(sel);
+      if (el) {
+        const t = (el.textContent || '').trim().replace(/\s+/g, ' ');
+        if (t) return t;
+      }
+    } catch {}
+  }
+  return '';
+}
+function pickPrice(doc, selectors) {
+  const symbols = ['$','£','€','¥','₹','CAD','USD','GBP','EUR','AUD'];
+  for (const sel of selectors) {
+    try {
+      const el = doc.querySelector(sel);
+      if (el) {
+        const t = (el.textContent || '').trim().replace(/\s+/g,' ');
+        if (symbols.some(s => t.includes(s))) return t;
+      }
+    } catch {}
+  }
+  return '';
+}
+function extractItemSpecifics(doc) {
+  const out = {};
+  // dt/dd pattern (modern eBay layout)
+  doc.querySelectorAll('dl, .ux-labels-values, .x-about-this-item__table').forEach(container => {
+    const dts = container.querySelectorAll('dt, .ux-labels-values__labels-content');
+    const dds = container.querySelectorAll('dd, .ux-labels-values__values-content');
+    if (dts.length && dts.length === dds.length) {
+      dts.forEach((dt, i) => {
+        const k = (dt.textContent || '').trim();
+        const v = (dds[i].textContent || '').trim();
+        if (k && v && k.length < 60) out[k] = v;
+      });
+    }
+  });
+  // Table rows
+  doc.querySelectorAll('table tr, .ux-table-view__row').forEach(tr => {
+    const cells = tr.querySelectorAll('td, th');
+    if (cells.length >= 2) {
+      const k = (cells[0].textContent || '').trim();
+      const v = (cells[1].textContent || '').trim();
+      if (k && v && k.length < 60) out[k] = v;
+    }
+  });
+  // JSON-LD
+  doc.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
+    try {
+      const data = JSON.parse(s.textContent);
+      const arr = Array.isArray(data) ? data : [data];
+      for (const d of arr) {
+        if (d && d.brand) out.Brand = out.Brand || (typeof d.brand === 'object' ? d.brand.name : String(d.brand));
+        if (d && d.color) out.Color = out.Color || String(d.color);
+        if (d && d.material) out.Material = out.Material || String(d.material);
+        if (d && d.model) out.Model = out.Model || String(d.model);
+        if (d && Array.isArray(d.additionalProperty)) {
+          for (const p of d.additionalProperty) {
+            if (p && p.name && p.value) out[p.name] = out[p.name] || String(p.value);
+          }
+        }
+      }
+    } catch {}
+  });
+  return out;
+}
+function extractDescription(doc) {
+  const sels = ['.product-description','#viTabs_0_pnlDesc','#desc_div','#descArea','.x-item-description','article[itemprop="description"]'];
+  for (const s of sels) {
+    const el = doc.querySelector(s);
+    if (el) {
+      const t = (el.textContent || '').replace(/\s+/g,' ').trim();
+      if (t) return t.slice(0, 5000);
+    }
+  }
+  return '';
+}
+function extractImageUrls(doc) {
+  const urls = new Set();
+  const push = u => { if (u && /^https?:/.test(u)) urls.add(u); };
+  // Gallery containers
+  ['[data-testid="ux-image-carousel"]', '.ux-image-carousel', '.ux-image-filmstrip-carousel', '#PicturePanel', '#mainImgHldr']
+    .forEach(sel => doc.querySelectorAll(sel + ' img').forEach(img => {
+      push(img.getAttribute('src'));
+      push(img.getAttribute('data-src'));
+      push(img.getAttribute('data-zoom-src'));
+    }));
+  // Open Graph
+  doc.querySelectorAll('meta[property="og:image"]').forEach(m => push(m.getAttribute('content')));
+  // JSON-LD images
+  doc.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
+    try {
+      const data = JSON.parse(s.textContent);
+      const arr = Array.isArray(data) ? data : [data];
+      for (const d of arr) {
+        if (!d) continue;
+        if (typeof d.image === 'string') push(d.image);
+        else if (Array.isArray(d.image)) d.image.forEach(push);
+        else if (d.image && d.image.url) push(d.image.url);
+      }
+    } catch {}
+  });
+  // Upgrade to high-res (eBay s-l64.jpg, s-l500.jpg → s-l1600.webp)
+  const out = [];
+  for (const u of urls) {
+    let hr = u.replace(/s-l\d+\.(jpg|jpeg|png|webp)/i, 's-l1600.jpg');
+    out.push(hr);
+  }
+  return [...new Set(out)];
+}
+async function scrapeEbay(url) {
+  log('info', 'Scraping ' + url);
+  const html = await fetchEbayHtml(url);
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+
+  const titleSelectors = ['h1[id="x-title-label-lbl"]','h1.x-title-label-lbl','h1.x-item-title__mainTitle','h1[data-testid="x-item-title-mainTitle"]','h1.notranslate','#vi-lkhdr-itmTitl'];
+  const priceSelectors = ['[data-testid="price"]','[data-testid="x-price"]','[data-testid="x-bin-price"]','.x-price-primary > span','.x-price-approx__price','span[itemprop="price"]','#prcIsum','#mm-saleDscPrc'];
+  const condSelectors  = ['.x-item-condition-text .ux-textspans','.x-item-condition-text','[data-testid="u-flL condText"] span','#vi-itm-cond','.d-item-condition'];
+  const sellerSelectors= ['[data-testid="str-title"] a','.seller-persona-title a','#mbgLink','a[href*="feedback"]'];
+  const shipSelectors  = ['[data-testid="vi-price-ship"]','#fshippingCost','#shSummary'];
+
+  const data = {
+    url,
+    title: pickFirstText(doc, titleSelectors),
+    price: pickPrice(doc, priceSelectors),
+    condition: pickFirstText(doc, condSelectors),
+    seller: pickFirstText(doc, sellerSelectors),
+    shipping: pickFirstText(doc, shipSelectors),
+    item_specifics: extractItemSpecifics(doc),
+    description: extractDescription(doc),
+    image_urls: extractImageUrls(doc),
+    item_id: '',
+    brand: '',
+    scraped_at: nowStamp(),
+  };
+  data.brand = data.item_specifics.Brand || '';
+  data.item_id = extractItemIdFromUrl(url) || '';
+  if (!data.item_id) {
+    // DOM fallback: "eBay item number:"
+    const m = (doc.body && doc.body.innerText || '').match(/eBay item number:\s*(\d{6,})/i);
+    if (m) data.item_id = m[1];
+  }
+  if (!data.title) throw new Error('Could not extract title – page may be blocked or layout changed');
+  log('info', `Extracted: ${data.title.slice(0,60)}... (id=${data.item_id}, brand=${data.brand})`);
+  return data;
+}
+
+// ---------- Folder write helpers (File System Access API) ----------
+async function getOrCreateSubfolder(parentHandle, folderName) {
+  return await parentHandle.getDirectoryHandle(folderName, { create: true });
+}
+async function writeFileTo(handle, fileName, data) {
+  const file = await handle.getFileHandle(fileName, { create: true });
+  const w = await file.createWritable();
+  await w.write(data);
+  await w.close();
+}
+function buildProductFolderName(brand, itemId, fallbackTitle) {
+  let raw = (brand || '').trim();
+  if (!raw) {
+    const fw = (fallbackTitle || '').trim().split(/\s+/)[0];
+    raw = fw || 'Unknown';
+  }
+  const brandPart = safeFilename(raw, 60) || 'Unknown';
+  const idPart = itemId ? safeFilename(String(itemId), 40) : '';
+  return idPart ? `${brandPart} ${idPart}` : brandPart;
+}
+
+// ---------- CSV ----------
+function csvEscape(v) {
+  if (v == null) return '';
+  const s = String(v);
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
+}
+function appendCsvRow(product) {
+  const itemSpecificsStr = Object.entries(product.item_specifics || {}).map(([k,v]) => `${k}: ${v}`).join(' | ');
+  const row = {
+    'Scraped At': product.scraped_at,
+    'eBay URL': product.url,
+    'Title': product.title,
+    'Price': product.price,
+    'Condition': product.condition,
+    'Brand': product.brand,
+    'Seller': product.seller,
+    'Shipping': product.shipping,
+    'Description': (product.description || '').slice(0, 1000),
+    'Item Specifics': itemSpecificsStr,
+  };
+  CSV_ROWS.push(row);
+  saveJSON(STORAGE.csv, CSV_ROWS);
+}
+function buildCsv(rows) {
+  if (!rows.length) return '';
+  const headers = Object.keys(rows[0]);
+  const lines = [headers.join(',')];
+  for (const r of rows) lines.push(headers.map(h => csvEscape(r[h])).join(','));
+  return lines.join('\n');
+}
+async function persistCsv(targetFolderHandle) {
+  const csv = buildCsv(CSV_ROWS);
+  if (!csv) return;
+  if (targetFolderHandle) {
+    await writeFileTo(targetFolderHandle, 'EbayStore_Products.csv', csv);
+  } else {
+    downloadBlob(new Blob([csv], { type: 'text/csv' }), 'EbayStore_Products.csv');
+  }
+}
+function downloadBlob(blob, filename) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+function exportCsvNow() {
+  const csv = buildCsv(CSV_ROWS);
+  if (!csv) { toast('No CSV data yet'); return; }
+  downloadBlob(new Blob([csv], { type: 'text/csv' }), 'EbayStore_Products.csv');
+}
+
+// ---------- Image download (via CORS proxy) ----------
+async function fetchImageBlob(url) {
+  const proxy = SETTINGS.corsProxy || DEFAULT_SETTINGS.corsProxy;
+  const resp = await fetch(proxy + encodeURIComponent(url));
+  if (!resp.ok) throw new Error('Image HTTP ' + resp.status);
+  return await resp.blob();
+}
+function extFromMimeOrUrl(blob, url) {
+  const m = (blob.type || '').toLowerCase();
+  if (m.includes('jpeg')) return 'jpg';
+  if (m.includes('png')) return 'png';
+  if (m.includes('webp')) return 'webp';
+  if (m.includes('gif')) return 'gif';
+  const u = (url || '').toLowerCase();
+  for (const e of ['jpg','jpeg','png','webp','gif']) if (u.endsWith('.'+e)) return e;
+  return 'jpg';
+}
+async function saveImagesForProduct(product, productFolderHandle) {
+  const saved = [];
+  for (let i = 0; i < product.image_urls.length; i++) {
+    const url = product.image_urls[i];
+    try {
+      const blob = await fetchImageBlob(url);
+      const ext = extFromMimeOrUrl(blob, url);
+      const name = `image_${String(i+1).padStart(3,'0')}.${ext}`;
+      if (productFolderHandle) {
+        await writeFileTo(productFolderHandle, name, blob);
+      } else {
+        downloadBlob(blob, name);
+      }
+      saved.push(name);
+    } catch (e) {
+      log('warn', 'Image download failed for ' + url + ': ' + e.message);
+    }
+  }
+  return saved;
+}
+
+// ---------- SINGLE PRODUCT ----------
+async function handleSingleScrape() {
+  const url = document.getElementById('singleUrl').value.trim();
+  if (!url) { toast('Enter a URL', 'error'); return; }
+  if (!validateEbayUrl(url)) { toast('Not a valid eBay URL', 'error'); return; }
+  const out = document.getElementById('singleResults');
+  out.innerHTML = `<div class="card">⏳ Scraping… (using CORS proxy: <code>${escapeHtml(SETTINGS.corsProxy)}</code>)</div>`;
+  try {
+    const product = await scrapeEbay(url);
+    const folderName = buildProductFolderName(product.brand, product.item_id, product.title);
+
+    let productHandle = null;
+    if (FOLDER_HANDLE) {
+      productHandle = await getOrCreateSubfolder(FOLDER_HANDLE, folderName);
+      await writeFileTo(productHandle, 'description.md', product.description || '');
+      await writeFileTo(productHandle, 'raw.txt', JSON.stringify(product, null, 2));
+    }
+
+    out.innerHTML = renderProductCard(product, folderName) + `<div id="singleImagesGrid" class="grid-thumbs mt-4"></div>
+      <p class="text-sm text-gray-600 mt-3" id="singleSaveStatus">⏳ Downloading images…</p>`;
+    const saved = await saveImagesForProduct(product, productHandle);
+    document.getElementById('singleSaveStatus').textContent = productHandle
+      ? `✅ Saved ${saved.length} image(s) into folder "${folderName}".`
+      : `✅ Downloaded ${saved.length} image(s) (no folder picked – delivered as downloads).`;
+
+    // Live thumbs (use original URLs for preview)
+    document.getElementById('singleImagesGrid').innerHTML = product.image_urls.slice(0, 12).map(u =>
+      `<img src="${escapeHtml(u)}" referrerpolicy="no-referrer" />`).join('');
+
+    appendCsvRow(product);
+    if (productHandle && FOLDER_HANDLE) await persistCsv(FOLDER_HANDLE);
+    RESULTS.push(product); saveJSON(STORAGE.results, RESULTS);
+    toast('Scraped: ' + product.title.slice(0, 40), 'success');
+  } catch (e) {
+    log('error', 'Single scrape failed: ' + e.message);
+    out.innerHTML = `<div class="card text-red-700">❌ Failed: ${escapeHtml(e.message)}<br><span class="text-sm text-gray-600">If this is a CORS error, try a different proxy in Settings (e.g. <code>https://api.allorigins.win/raw?url=</code>).</span></div>`;
+  }
+}
+
+function renderProductCard(p, folderName) {
+  const main = (p.image_urls && p.image_urls[0]) || '';
+  const specs = Object.entries(p.item_specifics || {}).slice(0, 12).map(([k,v]) =>
+    `<div class="card !p-2"><div class="text-[.7rem] uppercase tracking-wide text-gray-500">${escapeHtml(k)}</div><div class="text-sm">${escapeHtml(v)}</div></div>`).join('');
+  return `
+  <div class="card">
+    <div class="flex gap-4 flex-col md:flex-row">
+      <div class="md:w-1/3">
+        ${main ? `<img src="${escapeHtml(main)}" referrerpolicy="no-referrer" class="w-full rounded-lg border border-gray-200" />` : ''}
+      </div>
+      <div class="md:w-2/3">
+        <h3 class="text-lg font-semibold mb-1">${escapeHtml(p.title)}</h3>
+        <div class="text-2xl font-bold text-gray-900 mb-3">${escapeHtml(p.price)}</div>
+        <div class="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
+          <div><span class="text-gray-500">Brand:</span> <b>${escapeHtml(p.brand || 'N/A')}</b></div>
+          <div><span class="text-gray-500">Item ID:</span> <b>${escapeHtml(p.item_id || 'N/A')}</b></div>
+          <div><span class="text-gray-500">Condition:</span> ${escapeHtml(p.condition || 'N/A')}</div>
+          <div><span class="text-gray-500">Seller:</span> ${escapeHtml(p.seller || 'N/A')}</div>
+          <div><span class="text-gray-500">Shipping:</span> ${escapeHtml(p.shipping || 'N/A')}</div>
+          <div><span class="text-gray-500">Folder:</span> <code>${escapeHtml(folderName)}</code></div>
+        </div>
+      </div>
+    </div>
+    ${specs ? `<details class="mt-4"><summary class="font-medium text-sm">📋 Item specifics</summary><div class="grid grid-cols-2 md:grid-cols-3 gap-2 mt-2">${specs}</div></details>` : ''}
+    ${p.description ? `<details class="mt-3"><summary class="font-medium text-sm">📝 Description</summary><div class="text-sm text-gray-700 mt-2 whitespace-pre-wrap">${escapeHtml(p.description.slice(0, 4000))}</div></details>` : ''}
+  </div>`;
+}
+
+// ---------- BATCH ----------
+function renderQueue() {
+  document.getElementById('qTotal').textContent = QUEUE.length;
+  document.getElementById('qPending').textContent = QUEUE.filter(q => q.status === 'Pending').length;
+  document.getElementById('qDone').textContent = QUEUE.filter(q => q.status === 'Done').length;
+  document.getElementById('qErrors').textContent = QUEUE.filter(q => (q.status||'').startsWith('Error')).length;
+
+  const tbody = document.getElementById('queueBody');
+  tbody.innerHTML = QUEUE.map(item => {
+    const cls = item.status === 'Done' ? 'badge-done' :
+                item.status === 'Pending' ? 'badge-pending' :
+                item.status === 'Processing' ? 'badge-processing' : 'badge-error';
+    return `<tr>
+      <td class="font-mono text-xs break-all">${escapeHtml(item.url)}</td>
+      <td><span class="badge ${cls}">${escapeHtml(item.status)}</span></td>
+      <td>${escapeHtml(item.note || '')}</td>
+      <td class="text-xs text-gray-500">${escapeHtml(item.updated_at || '')}</td>
+      <td class="text-xs text-red-700">${escapeHtml(item.error || '')}</td>
+    </tr>`;
+  }).join('');
+}
+async function readCsvFromInput(file) {
+  const text = await file.text();
+  // Naive CSV parse: pick the column containing 'http' or first column
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  if (!lines.length) return [];
+  const header = lines[0].split(',');
+  let urlCol = header.findIndex(h => /url|link|ebay|website/i.test(h));
+  if (urlCol < 0) urlCol = 0;
+  const out = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(',');
+    const v = (cols[urlCol] || '').trim().replace(/^"|"$/g, '');
+    if (v) out.push(v);
+  }
+  return out;
+}
+async function addToBatchQueue() {
+  const text = document.getElementById('batchPaste').value;
+  const file = document.getElementById('batchFile').files[0];
+  let candidates = parseUrlInput(text);
+  if (file) {
+    try {
+      const fromFile = await readCsvFromInput(file);
+      candidates = candidates.concat(fromFile);
+    } catch (e) { toast('CSV parse error: ' + e.message, 'error'); }
+  }
+  const valid = []; const invalid = [];
+  for (const u of candidates) (validateEbayUrl(u) ? valid : invalid).push(u);
+  const dedup = [...new Set(valid)];
+  const existing = new Set(QUEUE.map(q => q.url));
+  let added = 0;
+  for (const url of dedup) {
+    if (!existing.has(url)) {
+      QUEUE.push({ url, status: 'Pending', note: file ? 'File Import' : 'Manual Paste', updated_at: nowStamp(), error: '' });
+      existing.add(url); added++;
+    }
+  }
+  saveJSON(STORAGE.queue, QUEUE);
+  renderQueue();
+  toast(`Added ${added} item(s). ${invalid.length ? invalid.length + ' invalid skipped.' : ''}`, 'success');
+  if (added) document.getElementById('batchPaste').value = '';
+}
+async function processBatchQueue() {
+  const pending = QUEUE.filter(q => q.status === 'Pending');
+  if (!pending.length) { toast('No pending items'); return; }
+  const workers = Math.max(1, Math.min(6, parseInt(document.getElementById('batchWorkers').value) || 3));
+  const total = pending.length;
+  let completed = 0, success = 0, fail = 0;
+
+  const progressBox = document.getElementById('batchProgress');
+  const bar = document.getElementById('batchBar');
+  const status = document.getElementById('batchStatus');
+  progressBox.classList.remove('hidden');
+
+  const updateUI = () => {
+    bar.style.width = (completed/total*100).toFixed(1) + '%';
+    status.textContent = `Completed ${completed}/${total} · Success ${success} · Failed ${fail}`;
+  };
+
+  const setStatus = (url, status_, error='') => {
+    const item = QUEUE.find(q => q.url === url);
+    if (item) { item.status = status_; item.error = error; item.updated_at = nowStamp(); saveJSON(STORAGE.queue, QUEUE); renderQueue(); }
+  };
+
+  // Simple worker pool
+  const queue = pending.map(p => p.url);
+  async function worker() {
+    while (queue.length) {
+      const url = queue.shift();
+      setStatus(url, 'Processing');
+      try {
+        const product = await scrapeEbay(url);
+        const folderName = buildProductFolderName(product.brand, product.item_id, product.title);
+        let productHandle = null;
+        if (FOLDER_HANDLE) {
+          productHandle = await getOrCreateSubfolder(FOLDER_HANDLE, folderName);
+          await writeFileTo(productHandle, 'description.md', product.description || '');
+          await writeFileTo(productHandle, 'raw.txt', JSON.stringify(product, null, 2));
+          await saveImagesForProduct(product, productHandle);
+        } else {
+          // No folder: skip image binary downloads to avoid 100s of file dialogs; still record CSV
+          log('warn', 'No folder picked – images skipped for ' + url);
+        }
+        appendCsvRow(product);
+        RESULTS.push(product); saveJSON(STORAGE.results, RESULTS);
+        setStatus(url, 'Done');
+        success++;
+      } catch (e) {
+        setStatus(url, 'Error', e.message);
+        fail++;
+        log('error', 'Batch fail ' + url + ': ' + e.message);
+      } finally {
+        completed++; updateUI();
+      }
+    }
+  }
+  const pool = Array.from({ length: Math.min(workers, queue.length) }, () => worker());
+  await Promise.all(pool);
+  if (FOLDER_HANDLE) await persistCsv(FOLDER_HANDLE);
+  toast(`Batch finished. ✅ ${success} · ❌ ${fail}`, fail ? '' : 'success');
+}
+function clearDoneQueue() {
+  QUEUE = QUEUE.filter(q => q.status !== 'Done'); saveJSON(STORAGE.queue, QUEUE); renderQueue();
+}
+function clearAllQueue() {
+  if (!confirm('Clear the entire queue?')) return;
+  QUEUE = []; saveJSON(STORAGE.queue, QUEUE); renderQueue();
+}
+function resetErrorsToPending() {
+  let n = 0;
+  for (const q of QUEUE) if ((q.status || '').startsWith('Error')) { q.status = 'Pending'; q.error = ''; n++; }
+  saveJSON(STORAGE.queue, QUEUE); renderQueue();
+  toast(`Reset ${n} error(s) to Pending`);
+}
+function exportQueueCsv() {
+  if (!QUEUE.length) { toast('Queue is empty'); return; }
+  const headers = ['url','status','note','updated_at','error'];
+  const csv = [headers.join(',')].concat(QUEUE.map(q => headers.map(h => csvEscape(q[h] || '')).join(','))).join('\n');
+  downloadBlob(new Blob([csv], { type: 'text/csv' }), 'batch_queue.csv');
+}
+
+// ---------- AI (Groq) ----------
+function refreshAIProductSelect() {
+  const sel = document.getElementById('aiProductSelect');
+  sel.innerHTML = RESULTS.length
+    ? RESULTS.map((r,i) => `<option value="${i}">${escapeHtml(r.title.slice(0, 80))}</option>`).join('')
+    : '<option value="">(no scraped products yet)</option>';
+}
+function getSelectedProduct() {
+  const idx = parseInt(document.getElementById('aiProductSelect').value);
+  return Number.isInteger(idx) && RESULTS[idx] ? RESULTS[idx] : null;
+}
+function buildPrompt(product, platform) {
+  const specs = Object.entries(product.item_specifics || {}).map(([k,v]) => `- ${k}: ${v}`).join('\n');
+  return `You are an expert e-commerce copywriter. Write a polished, accurate product description for ${platform.toUpperCase()}.
+
+PRODUCT DATA
+Title: ${product.title}
+Brand: ${product.brand}
+Price: ${product.price}
+Condition: ${product.condition}
+Item ID: ${product.item_id}
+
+ITEM SPECIFICS
+${specs}
+
+ORIGINAL DESCRIPTION (for reference, may be noisy):
+${(product.description || '').slice(0, 1500)}
+
+Write 200-350 words. Markdown headings allowed. Highlight features, condition, brand. No invented specs.`;
+}
+async function callGroq(messages, model) {
+  if (!SETTINGS.groqKey) throw new Error('Groq API key not set – open Settings.');
+  const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + SETTINGS.groqKey, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: model || 'llama-3.3-70b-versatile', messages, temperature: 0.5, max_tokens: 1024 }),
+  });
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error('Groq HTTP ' + resp.status + ': ' + txt.slice(0, 200));
+  }
+  const data = await resp.json();
+  return data.choices?.[0]?.message?.content || '';
+}
+async function generateAIDescription() {
+  const p = getSelectedProduct();
+  if (!p) { toast('No product selected. Scrape one first.', 'error'); return; }
+  const platform = document.getElementById('aiPlatform').value;
+  const model = document.getElementById('aiModel').value;
+  const out = document.getElementById('aiOutput');
+  out.value = '⏳ Generating with ' + model + '…';
+  try {
+    const txt = await callGroq([{ role: 'user', content: buildPrompt(p, platform) }], model);
+    out.value = txt;
+    toast('Generated', 'success');
+  } catch (e) {
+    out.value = '❌ ' + e.message;
+    log('error', 'Groq error: ' + e.message);
+  }
+}
+function copyAIOutput() {
+  const v = document.getElementById('aiOutput').value;
+  if (!v) return;
+  navigator.clipboard.writeText(v).then(() => toast('Copied'));
+}
+function downloadAIOutput() {
+  const v = document.getElementById('aiOutput').value;
+  if (!v) return;
+  downloadBlob(new Blob([v], { type: 'text/markdown' }), 'ai_description.md');
+}
+function renderChat() {
+  const box = document.getElementById('chatBox');
+  box.innerHTML = CHAT.map(m => `<div class="chat-msg ${m.role==='user'?'chat-user':'chat-ai'}">${escapeHtml(m.content)}</div>`).join('');
+  box.scrollTop = box.scrollHeight;
+}
+async function sendChat() {
+  const inp = document.getElementById('chatInput');
+  const text = inp.value.trim();
+  if (!text) return;
+  inp.value = '';
+  CHAT.push({ role: 'user', content: text });
+  renderChat();
+  const p = getSelectedProduct();
+  const sysPrompt = p
+    ? `You are an assistant for the eBay product: "${p.title}" (Brand: ${p.brand}, Price: ${p.price}). Refer to it when relevant.`
+    : `You are a helpful e-commerce assistant.`;
+  const messages = [{ role: 'system', content: sysPrompt }, ...CHAT];
+  try {
+    const reply = await callGroq(messages, document.getElementById('aiModel').value);
+    CHAT.push({ role: 'assistant', content: reply });
+  } catch (e) {
+    CHAT.push({ role: 'assistant', content: '❌ ' + e.message });
+  }
+  saveJSON(STORAGE.chat, CHAT);
+  renderChat();
+}
+function clearChat() { CHAT = []; saveJSON(STORAGE.chat, CHAT); renderChat(); }
+
+// ---------- IMAGE ENHANCEMENT (Canvas) ----------
+['brightness','contrast','sharpness','saturation','logoRatio','logoMargin','logoOpacity'].forEach(id => {
+  document.addEventListener('DOMContentLoaded', () => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const out = document.getElementById('v' + id.charAt(0).toUpperCase() + id.slice(1));
+    el.addEventListener('input', () => { if (out) out.textContent = el.value; });
+  });
+});
+function applyPreset(name) {
+  const presets = {
+    ebay:      { brightness:1.10, contrast:1.15, sharpness:1.20, saturation:1.05 },
+    instagram: { brightness:1.05, contrast:1.20, sharpness:1.15, saturation:1.25 },
+    pro:       { brightness:1.02, contrast:1.08, sharpness:1.25, saturation:0.98 },
+    reset:     { brightness:1.00, contrast:1.00, sharpness:1.00, saturation:1.00 },
+  };
+  const p = presets[name]; if (!p) return;
+  for (const [k,v] of Object.entries(p)) {
+    document.getElementById(k).value = v;
+    document.getElementById('v' + k.charAt(0).toUpperCase() + k.slice(1)).textContent = v;
+  }
+}
+document.addEventListener('DOMContentLoaded', () => {
+  const e = document.getElementById('enhInput');
+  if (e) e.addEventListener('change', async () => {
+    UPLOADED_IMAGES = await Promise.all([...e.files].map(async f => ({ name: f.name, blob: f })));
+    toast(`${UPLOADED_IMAGES.length} image(s) loaded`);
+  });
+  const li = document.getElementById('logoInput');
+  if (li) li.addEventListener('change', () => {
+    const f = li.files[0];
+    if (!f) return;
+    LOGO_BLOB = f;
+    const img = document.getElementById('logoPreview');
+    img.src = URL.createObjectURL(f); img.classList.remove('hidden');
+  });
+});
+async function loadImagesFromFolder() {
+  if (!FOLDER_HANDLE) { toast('Pick a folder in Settings first', 'error'); return; }
+  const items = [];
+  for await (const [name, h] of FOLDER_HANDLE.entries()) {
+    if (h.kind === 'file' && /\.(jpe?g|png|webp|bmp|gif)$/i.test(name)) {
+      const f = await h.getFile();
+      items.push({ name, blob: f });
+    }
+  }
+  UPLOADED_IMAGES = items;
+  toast(`Loaded ${items.length} image(s) from folder`);
+}
+function blobToImage(blob) {
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => res(img);
+    img.onerror = rej;
+    img.src = URL.createObjectURL(blob);
+  });
+}
+function applyEnhancementToCanvas(img, opts) {
+  const canvas = document.createElement('canvas');
+  canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+  const ctx = canvas.getContext('2d');
+  // CSS filter handles brightness/contrast/saturation
+  const fParts = [];
+  fParts.push(`brightness(${opts.brightness})`);
+  fParts.push(`contrast(${opts.contrast})`);
+  fParts.push(`saturate(${opts.saturation})`);
+  ctx.filter = fParts.join(' ');
+  ctx.drawImage(img, 0, 0);
+  // Sharpness via convolution-style unsharp mask if > 1.0
+  if (opts.sharpness > 1.01) sharpenCanvas(ctx, canvas, opts.sharpness - 1);
+  return canvas;
+}
+function sharpenCanvas(ctx, canvas, amount) {
+  // Lightweight unsharp mask using a 3x3 kernel
+  const w = canvas.width, h = canvas.height;
+  try {
+    const src = ctx.getImageData(0, 0, w, h);
+    const dst = ctx.createImageData(w, h);
+    const a = Math.min(2, Math.max(0, amount));
+    const k = [
+      0, -1*a, 0,
+      -1*a, 1+4*a, -1*a,
+      0, -1*a, 0,
+    ];
+    const pix = src.data, dpix = dst.data;
+    for (let y = 1; y < h-1; y++) {
+      for (let x = 1; x < w-1; x++) {
+        for (let c = 0; c < 3; c++) {
+          let sum = 0;
+          for (let ky = -1; ky <= 1; ky++) for (let kx = -1; kx <= 1; kx++) {
+            const idx = ((y+ky)*w + (x+kx))*4 + c;
+            sum += pix[idx] * k[(ky+1)*3 + (kx+1)];
+          }
+          dpix[(y*w + x)*4 + c] = Math.max(0, Math.min(255, sum));
+        }
+        dpix[(y*w + x)*4 + 3] = pix[(y*w + x)*4 + 3];
+      }
+    }
+    ctx.putImageData(dst, 0, 0);
+  } catch (e) { /* might fail on tainted canvas */ }
+}
+async function overlayLogoOnCanvas(canvas, logoImg, opts) {
+  const ctx = canvas.getContext('2d');
+  const logoW = canvas.width * opts.size_ratio;
+  const logoH = logoImg.naturalHeight * (logoW / Math.max(1, logoImg.naturalWidth));
+  let x, y;
+  switch (opts.position) {
+    case 'bottom-left':  x = opts.margin; y = canvas.height - logoH - opts.margin; break;
+    case 'top-right':    x = canvas.width - logoW - opts.margin; y = opts.margin; break;
+    case 'top-left':     x = opts.margin; y = opts.margin; break;
+    case 'center':       x = (canvas.width - logoW)/2; y = (canvas.height - logoH)/2; break;
+    default:             x = canvas.width - logoW - opts.margin; y = canvas.height - logoH - opts.margin;
+  }
+  ctx.globalAlpha = opts.opacity;
+  ctx.drawImage(logoImg, x, y, logoW, logoH);
+  ctx.globalAlpha = 1.0;
+}
+function readEnhanceOpts() {
+  return {
+    brightness: parseFloat(document.getElementById('brightness').value),
+    contrast:   parseFloat(document.getElementById('contrast').value),
+    sharpness:  parseFloat(document.getElementById('sharpness').value),
+    saturation: parseFloat(document.getElementById('saturation').value),
+    size_ratio: parseFloat(document.getElementById('logoRatio').value),
+    margin:     parseInt(document.getElementById('logoMargin').value),
+    opacity:    parseFloat(document.getElementById('logoOpacity').value),
+    position:   document.getElementById('logoPosition').value,
+  };
+}
+async function processOne(blob, name, opts, logoImg) {
+  const img = await blobToImage(blob);
+  const canvas = applyEnhancementToCanvas(img, opts);
+  if (logoImg) await overlayLogoOnCanvas(canvas, logoImg, opts);
+  const ext = (name.split('.').pop() || 'jpg').toLowerCase();
+  const mime = (ext === 'png') ? 'image/png' : (ext === 'webp') ? 'image/webp' : 'image/jpeg';
+  const outBlob = await new Promise(r => canvas.toBlob(r, mime, 0.95));
+  const outName = name.replace(/\.[^.]+$/, '') + '_enhanced.' + (ext === 'webp' ? 'jpg' : ext);
+  return { blob: outBlob, name: outName };
+}
+async function enhancePreview() {
+  if (!UPLOADED_IMAGES.length) { toast('Load images first', 'error'); return; }
+  const logoImg = LOGO_BLOB ? await blobToImage(LOGO_BLOB) : null;
+  const opts = readEnhanceOpts();
+  const out = await processOne(UPLOADED_IMAGES[0].blob, UPLOADED_IMAGES[0].name, opts, logoImg);
+  const url = URL.createObjectURL(out.blob);
+  document.getElementById('enhResults').innerHTML = `<img src="${url}" />`;
+}
+async function enhanceAll(saveToFolder=false) {
+  if (!UPLOADED_IMAGES.length) { toast('Load images first', 'error'); return; }
+  const logoImg = LOGO_BLOB ? await blobToImage(LOGO_BLOB) : null;
+  const opts = readEnhanceOpts();
+  const grid = document.getElementById('enhResults'); grid.innerHTML = '';
+  LAST_ENHANCE_OUTPUTS = [];
+
+  let outFolder = null;
+  if (saveToFolder) {
+    if (!FOLDER_HANDLE) { toast('Pick a folder in Settings first', 'error'); return; }
+    outFolder = await getOrCreateSubfolder(FOLDER_HANDLE, 'Enhanced');
+  }
+
+  for (const item of UPLOADED_IMAGES) {
+    try {
+      const out = await processOne(item.blob, item.name, opts, logoImg);
+      LAST_ENHANCE_OUTPUTS.push(out);
+      const url = URL.createObjectURL(out.blob);
+      const div = document.createElement('div');
+      div.innerHTML = `<img src="${url}" /><div class="text-xs truncate text-gray-600 mt-1">${escapeHtml(out.name)}</div>`;
+      grid.appendChild(div);
+      if (outFolder) await writeFileTo(outFolder, out.name, out.blob);
+      else downloadBlob(out.blob, out.name);
+    } catch (e) {
+      log('error', 'Enhance failed for ' + item.name + ': ' + e.message);
+    }
+  }
+  toast(`Processed ${LAST_ENHANCE_OUTPUTS.length} image(s)`, 'success');
+}
+
+// ---------- IMAGE FORMAT (WebP -> X) ----------
+async function rescanWebpFolders() {
+  WEBP_FOLDER_LIST = [];
+  const sel = document.getElementById('webpFolderSelect');
+  if (!FOLDER_HANDLE) {
+    sel.innerHTML = '<option value="">(no root folder picked – use Settings)</option>';
+    return;
+  }
+  // Walk root + immediate subfolders looking for .webp
+  async function scan(handle, label) {
+    let count = 0;
+    for await (const [name, h] of handle.entries()) {
+      if (h.kind === 'file' && /\.webp$/i.test(name)) count++;
+    }
+    if (count > 0) WEBP_FOLDER_LIST.push({ handle, name: label, count });
+  }
+  await scan(FOLDER_HANDLE, '(root) ' + FOLDER_HANDLE.name);
+  for await (const [name, h] of FOLDER_HANDLE.entries()) {
+    if (h.kind === 'directory') {
+      try { await scan(h, name); } catch {}
+    }
+  }
+  sel.innerHTML = WEBP_FOLDER_LIST.length
+    ? WEBP_FOLDER_LIST.map((f,i) => `<option value="${i}">${escapeHtml(f.name)} (${f.count} webp)</option>`).join('')
+    : '<option value="">(no folders with WebP found)</option>';
+}
+async function convertWebpFolder() {
+  const idx = parseInt(document.getElementById('webpFolderSelect').value);
+  if (isNaN(idx) || !WEBP_FOLDER_LIST[idx]) { toast('Pick a folder with webp first', 'error'); return; }
+  const target = document.getElementById('webpTarget').value;
+  const fh = WEBP_FOLDER_LIST[idx].handle;
+  const status = document.getElementById('webpStatus');
+  status.textContent = 'Converting…';
+  let ok = 0, fail = 0;
+  for await (const [name, h] of fh.entries()) {
+    if (h.kind !== 'file' || !/\.webp$/i.test(name)) continue;
+    try {
+      const file = await h.getFile();
+      const img = await blobToImage(file);
+      const canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext('2d');
+      // For JPG/JPEG/BMP, paint white background under transparent pixels
+      if (target === 'jpg' || target === 'jpeg' || target === 'bmp') {
+        ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+      ctx.drawImage(img, 0, 0);
+      const mime = (target === 'png') ? 'image/png'
+                 : (target === 'jpg' || target === 'jpeg') ? 'image/jpeg'
+                 : (target === 'gif') ? 'image/gif'
+                 : 'image/png'; // BMP not supported by canvas → fall back to PNG
+      const blob = await new Promise(r => canvas.toBlob(r, mime, 0.95));
+      const newName = name.replace(/\.webp$/i, '.' + target);
+      await writeFileTo(fh, newName, blob);
+      await fh.removeEntry(name);
+      ok++;
+    } catch (e) {
+      fail++; log('error', 'WebP convert failed for ' + name + ': ' + e.message);
+    }
+  }
+  status.textContent = `✅ Converted ${ok}, ❌ Failed ${fail}.`;
+  toast('WebP conversion done', fail ? 'error' : 'success');
+  await rescanWebpFolders();
+}
+async function convertWebpUploaded() {
+  const files = document.getElementById('webpInput').files;
+  if (!files.length) { toast('Pick .webp files first', 'error'); return; }
+  const target = document.getElementById('webpTarget').value;
+  const status = document.getElementById('webpStatus'); status.textContent = 'Converting…';
+  let ok = 0, fail = 0;
+  for (const f of files) {
+    try {
+      const img = await blobToImage(f);
+      const canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext('2d');
+      if (target === 'jpg' || target === 'jpeg' || target === 'bmp') { ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,canvas.width,canvas.height); }
+      ctx.drawImage(img, 0, 0);
+      const mime = (target === 'png') ? 'image/png' : (target === 'jpg' || target === 'jpeg') ? 'image/jpeg' : 'image/png';
+      const blob = await new Promise(r => canvas.toBlob(r, mime, 0.95));
+      downloadBlob(blob, f.name.replace(/\.webp$/i, '.' + target));
+      ok++;
+    } catch (e) { fail++; log('error', 'Convert ' + f.name + ' failed: ' + e.message); }
+  }
+  status.textContent = `✅ Converted ${ok}, ❌ Failed ${fail}.`;
+}
+
+// ---------- LOGS ----------
+function renderLogs() {
+  const box = document.getElementById('logBox');
+  if (!box) return;
+  box.innerHTML = LOGS.slice(-200).map(l => {
+    const cls = l.level === 'error' ? 'log-error' : l.level === 'warn' ? 'log-warn' : l.level === 'debug' ? 'log-debug' : 'log-info';
+    return `<div class="log-line ${cls}">[${l.ts}] [${l.level.toUpperCase()}] ${escapeHtml(l.msg)}</div>`;
+  }).join('') || '<div class="text-sm text-gray-500">No logs yet.</div>';
+}
+function downloadLogs() {
+  const text = LOGS.map(l => `[${l.ts}] [${l.level.toUpperCase()}] ${l.msg}`).join('\n');
+  downloadBlob(new Blob([text], { type:'text/plain' }), 'ebay_scraper.log');
+}
+function clearLogs() { LOGS = []; saveJSON(STORAGE.logs, LOGS); renderLogs(); }
+
+// ---------- Boot ----------
+document.addEventListener('DOMContentLoaded', () => {
+  refreshFolderHints();
+  renderQueue();
+  renderChat();
+  refreshAIProductSelect();
+  log('info', 'App ready. CORS proxy: ' + SETTINGS.corsProxy);
+  if (!('showDirectoryPicker' in window)) {
+    log('warn', 'File System Access API not supported in this browser. Folder picker disabled; downloads will be used.');
+  }
+});
+</script>
+</body>
+</html>
