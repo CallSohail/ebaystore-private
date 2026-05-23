@@ -2419,23 +2419,46 @@ BATCH_QUEUE_PATH = Path.cwd() / '.batch_queue.json'
 _BATCH_QUEUE_LOCK = threading.Lock()
 
 
+_URL_RX = re.compile(r'https?://[^\s,;\'"<>)]+', re.IGNORECASE)
+
+
 def parse_url_input(text: str) -> List[str]:
     """
-    Parse a free-form blob of URLs into a clean list.
+    Extract URLs from a free-form blob of text.
 
-    Splits on newlines, commas, semicolons, tabs and surrounding whitespace.
-    Strips leading/trailing punctuation (quotes, commas, semicolons) so a
-    trailing comma like "https://...,," produces a single clean URL.
-    Empty tokens are dropped.
+    Robust to: newlines, commas, semicolons, tabs, surrounding whitespace,
+    trailing punctuation (quotes, commas, semicolons, parens, angle brackets),
+    inline labels ("url1: https://..."), and bare host-only references
+    (`www.ebay.com/itm/123` is auto-prefixed with https://).
+
+    Non-URL tokens are silently dropped — the caller's validator will sort
+    valid eBay URLs from any leftover noise.
     """
     if not text:
         return []
-    tokens = re.split(r'[\s,;]+', text)
+
+    # First pass: pick out anything that already looks like a URL.
+    found = [m.group(0) for m in _URL_RX.finditer(text)]
+
+    # Second pass: for bare tokens lacking a scheme but starting with www. or
+    # *.ebay.*, treat them as URLs and prefix https://.
+    for tok in re.split(r'[\s,;]+', text):
+        bare = tok.strip().strip('\'"<>()[]').strip(',;')
+        if not bare:
+            continue
+        if bare.lower().startswith(('http://', 'https://')):
+            continue  # already captured by the regex above
+        if bare.lower().startswith('www.') or re.match(r'^[a-z0-9.-]*ebay\.', bare, re.IGNORECASE):
+            found.append('https://' + bare)
+
+    # Trim trailing punctuation per URL and deduplicate while preserving order.
     cleaned: List[str] = []
-    for tok in tokens:
-        tok = tok.strip().strip('\'"').strip(',;')
-        if tok:
-            cleaned.append(tok)
+    seen: set = set()
+    for u in found:
+        u = u.rstrip('.,;:!?')
+        if u and u not in seen:
+            cleaned.append(u)
+            seen.add(u)
     return cleaned
 
 
@@ -2486,109 +2509,156 @@ def update_queue_status(url: str, status: str, error: str = "") -> None:
             logger.error(f"Failed persisting queue status: {e}")
 
 
-def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> None:
-    """Local-CSV-backed batch processing tab."""
-    st.subheader("Batch Processing Operations")
-    st.caption("Queue is stored locally in `.batch_queue.json`. Scraped data is appended to `EbayStore_Products.csv`.")
+def _add_to_batch_queue(urls: List[str], scraper: "EbayScraper", source_note: str) -> Tuple[int, int, int]:
+    """Validate, dedupe and append URLs to the persisted batch queue.
 
+    Returns (added, duplicates_skipped, invalid_skipped).
+    """
     if 'batch_queue' not in st.session_state:
         st.session_state.batch_queue = load_batch_queue()
 
-    # --- Add New Items Section ---
-    st.markdown("### 📥 Add Links to Batch")
-
-    input_tab1, input_tab2 = st.tabs(["📁 File Upload (CSV/Excel)", "📝 Manual Paste"])
-
-    new_urls_to_add: List[str] = []
-    source_note = "Batch Import"
-
-    with input_tab1:
-        uploaded_file = st.file_uploader(
-            "Upload File",
-            type=['csv', 'xlsx', 'xls'],
-            help="Upload a list of URLs. Auto-detects URL/link/eBay column.",
-        )
-        if uploaded_file:
-            try:
-                if uploaded_file.name.lower().endswith('.csv'):
-                    df = pd.read_csv(uploaded_file)
-                else:
-                    df = pd.read_excel(uploaded_file)
-
-                if df is not None and not df.empty:
-                    possible_cols = [c for c in df.columns if any(x in str(c).lower() for x in ['url', 'link', 'ebay', 'website'])]
-                    target_col = possible_cols[0] if possible_cols else df.columns[0]
-                    st.caption(f"Reading URLs from column: `{target_col}`")
-                    raw = " ".join(df[target_col].dropna().astype(str).tolist())
-                    new_urls_to_add.extend(parse_url_input(raw))
-                    source_note = f"Import: {uploaded_file.name}"
-            except Exception as e:
-                st.error(f"Error reading file: {e}")
-
-    with input_tab2:
-        pasted_text = st.text_area(
-            "Paste eBay URLs (newline OR comma-separated; trailing commas are fine)",
-            height=200,
-            placeholder="https://www.ebay.com/itm/123, https://www.ebay.com/itm/456,\nhttps://www.ebay.com/itm/789",
-        )
-        if pasted_text:
-            new_urls_to_add.extend(parse_url_input(pasted_text))
-            if not source_note.startswith("Import"):
-                source_note = "Manual Paste"
-
-    if new_urls_to_add:
-        valid_urls: List[str] = []
-        invalid_urls: List[str] = []
-        for u in new_urls_to_add:
-            try:
-                if scraper.validate_ebay_url(u):
-                    valid_urls.append(u)
-                else:
-                    invalid_urls.append(u)
-            except Exception:
-                invalid_urls.append(u)
-
-        valid_urls = list(dict.fromkeys(valid_urls))
-
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.success(f"✅ {len(valid_urls)} valid eBay URL(s) ready to add.")
-        with col_b:
-            if invalid_urls:
-                with st.expander(f"⚠️ {len(invalid_urls)} invalid entries skipped"):
-                    for bad in invalid_urls[:30]:
-                        st.code(bad, language=None)
-
-        if valid_urls and st.button(f"➕ Add {len(valid_urls)} Items to Queue", type="primary"):
-            existing_urls = {item['url'] for item in st.session_state.batch_queue}
-            added = 0
-            for url in valid_urls:
-                if url not in existing_urls:
-                    st.session_state.batch_queue.append({
-                        'url': url,
-                        'status': 'Pending',
-                        'note': source_note,
-                        'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'error': '',
-                    })
-                    existing_urls.add(url)
-                    added += 1
-            save_batch_queue(st.session_state.batch_queue)
-            if added:
-                st.toast(f"Added {added} new items to the batch queue!", icon="🚀")
-                st.rerun()
+    valid: List[str] = []
+    invalid = 0
+    for u in urls:
+        try:
+            if u and scraper.validate_ebay_url(u):
+                valid.append(u)
             else:
-                st.warning("All provided URLs are already in the batch list.")
+                invalid += 1
+        except Exception:
+            invalid += 1
 
-    # --- Queue View ---
-    st.markdown("---")
-    st.markdown("### 📋 Current Queue")
+    # Dedupe within the new batch first
+    valid = list(dict.fromkeys(valid))
 
+    existing = {item['url'] for item in st.session_state.batch_queue}
+    added = 0
+    dupes = 0
+    for url in valid:
+        if url in existing:
+            dupes += 1
+            continue
+        st.session_state.batch_queue.append({
+            'url': url,
+            'status': 'Pending',
+            'note': source_note,
+            'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'error': '',
+        })
+        existing.add(url)
+        added += 1
+
+    if added:
+        save_batch_queue(st.session_state.batch_queue)
+    return added, dupes, invalid
+
+
+def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> None:
+    """Local-CSV-backed batch processing tab — redesigned with clearer UX."""
+    st.markdown(
+        """
+        <div class="es-card">
+            <div class="es-card-title">Batch processing</div>
+            <p class="es-card-sub">Queue is persisted locally to <code>.batch_queue.json</code>. Scraped rows append to <code>EbayStore_Products.csv</code>.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if 'batch_queue' not in st.session_state:
+        st.session_state.batch_queue = load_batch_queue()
+    if 'batch_processing' not in st.session_state:
+        st.session_state.batch_processing = False
+    if 'confirm_clear_queue' not in st.session_state:
+        st.session_state.confirm_clear_queue = False
+
+    # ---------------- 1. ADD LINKS ----------------
+    st.markdown("#### Add links to the queue")
+
+    input_tab1, input_tab2 = st.tabs(["File upload (CSV / Excel)", "Manual paste"])
+
+    # --- File upload (form clears uploader on submit) ---
+    with input_tab1:
+        with st.form("batch_file_form", clear_on_submit=True):
+            uploaded_file = st.file_uploader(
+                "Upload a CSV or Excel file",
+                type=['csv', 'xlsx', 'xls'],
+                help="The first column containing 'url', 'link' or 'ebay' is auto-detected; otherwise the first column is used.",
+                key="batch_file_upload",
+            )
+            submit_file = st.form_submit_button(
+                "Add file to queue", type="primary", use_container_width=True
+            )
+
+        if submit_file:
+            if not uploaded_file:
+                st.warning("No file selected. Choose a CSV or Excel file first.")
+            else:
+                try:
+                    if uploaded_file.name.lower().endswith('.csv'):
+                        df = pd.read_csv(uploaded_file)
+                    else:
+                        df = pd.read_excel(uploaded_file)
+
+                    if df is None or df.empty:
+                        st.warning("The uploaded file appears to be empty.")
+                    else:
+                        possible_cols = [c for c in df.columns if any(x in str(c).lower() for x in ['url', 'link', 'ebay', 'website'])]
+                        target_col = possible_cols[0] if possible_cols else df.columns[0]
+                        raw = " ".join(df[target_col].dropna().astype(str).tolist())
+                        urls = parse_url_input(raw)
+                        if not urls:
+                            st.warning(f"Column `{target_col}` contained no usable URLs.")
+                        else:
+                            added, dupes, invalid = _add_to_batch_queue(
+                                urls, scraper, source_note=f"Import: {uploaded_file.name}"
+                            )
+                            _report_add_result(added, dupes, invalid)
+                            if added:
+                                st.rerun()
+                except Exception as e:
+                    st.error(f"Could not read the file: {e}")
+
+    # --- Manual paste (form clears textarea on submit) ---
+    with input_tab2:
+        with st.form("batch_paste_form", clear_on_submit=True):
+            pasted_text = st.text_area(
+                "Paste eBay URLs — newlines, commas, semicolons or tabs all work",
+                height=180,
+                placeholder="https://www.ebay.com/itm/123456789012\nhttps://www.ebay.de/itm/987654321098\nhttps://ebay.to/abc123",
+                key="batch_paste_text",
+            )
+            col_a, col_b = st.columns([3, 1])
+            with col_a:
+                st.caption("Tip: duplicates and already-queued URLs are skipped automatically.")
+            with col_b:
+                submit_paste = st.form_submit_button(
+                    "Add to queue", type="primary", use_container_width=True
+                )
+
+        if submit_paste:
+            if not (pasted_text and pasted_text.strip()):
+                st.warning("Paste at least one URL before adding to the queue.")
+            else:
+                urls = parse_url_input(pasted_text)
+                if not urls:
+                    st.warning("No usable URLs detected in the pasted text.")
+                else:
+                    added, dupes, invalid = _add_to_batch_queue(
+                        urls, scraper, source_note="Manual paste"
+                    )
+                    _report_add_result(added, dupes, invalid)
+                    if added:
+                        st.rerun()
+
+    # ---------------- 2. QUEUE OVERVIEW ----------------
     queue = st.session_state.batch_queue
     pending_items = [it for it in queue if it.get('status', '').lower() == 'pending']
+    processing_items = [it for it in queue if it.get('status', '').lower() == 'processing']
     done_items = [it for it in queue if it.get('status', '').lower() == 'done']
     error_items = [it for it in queue if it.get('status', '').lower().startswith('error')]
 
+    st.markdown("#### Queue overview")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total", len(queue))
     m2.metric("Pending", len(pending_items))
@@ -2597,100 +2667,198 @@ def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> Non
 
     if queue:
         df_view = pd.DataFrame(queue)[['url', 'status', 'note', 'updated_at', 'error']]
-        st.dataframe(df_view, use_container_width=True, hide_index=True)
+        df_view.columns = ['URL', 'Status', 'Source', 'Updated', 'Error']
+        st.dataframe(
+            df_view,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "URL": st.column_config.LinkColumn("URL", width="large"),
+                "Status": st.column_config.TextColumn("Status", width="small"),
+                "Source": st.column_config.TextColumn("Source", width="medium"),
+                "Updated": st.column_config.TextColumn("Updated", width="medium"),
+                "Error": st.column_config.TextColumn("Error", width="medium"),
+            },
+        )
 
-        col_clear1, col_clear2, col_clear3 = st.columns(3)
-        with col_clear1:
-            if st.button("🗑️ Clear Done"):
+        # Queue management actions
+        col_q1, col_q2, col_q3, col_q4 = st.columns(4)
+        with col_q1:
+            if st.button(
+                "Clear done", use_container_width=True, key="bq_clear_done",
+                disabled=not done_items,
+                help="Remove successfully scraped items from the queue."
+            ):
                 st.session_state.batch_queue = [it for it in queue if it.get('status', '').lower() != 'done']
                 save_batch_queue(st.session_state.batch_queue)
                 st.rerun()
-        with col_clear2:
-            if st.button("🔄 Reset Errors to Pending"):
-                changed = 0
+        with col_q2:
+            if st.button(
+                "Retry errors", use_container_width=True, key="bq_retry_errors",
+                disabled=not error_items,
+                help="Mark all errored items as Pending so they will be retried."
+            ):
                 for it in st.session_state.batch_queue:
                     if it.get('status', '').lower().startswith('error'):
                         it['status'] = 'Pending'
                         it['error'] = ''
-                        changed += 1
                 save_batch_queue(st.session_state.batch_queue)
-                if changed:
-                    st.toast(f"Reset {changed} error item(s).", icon="🔄")
-                    st.rerun()
-        with col_clear3:
-            if st.button("❌ Clear Entire Queue"):
-                st.session_state.batch_queue = []
-                save_batch_queue([])
                 st.rerun()
+        with col_q3:
+            if st.button(
+                "Export queue (CSV)", use_container_width=True, key="bq_export",
+                disabled=not queue,
+            ):
+                buf = StringIO()
+                pd.DataFrame(queue).to_csv(buf, index=False)
+                st.download_button(
+                    "Download queue.csv",
+                    data=buf.getvalue(),
+                    file_name="batch_queue.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="bq_export_dl",
+                )
+        with col_q4:
+            if not st.session_state.confirm_clear_queue:
+                if st.button(
+                    "Clear queue", use_container_width=True, key="bq_clear_all",
+                    disabled=not queue,
+                ):
+                    st.session_state.confirm_clear_queue = True
+                    st.rerun()
+            else:
+                if st.button(
+                    "Confirm clear", type="primary", use_container_width=True, key="bq_clear_confirm",
+                ):
+                    st.session_state.batch_queue = []
+                    st.session_state.confirm_clear_queue = False
+                    save_batch_queue([])
+                    st.rerun()
+                if st.button(
+                    "Cancel", use_container_width=True, key="bq_clear_cancel",
+                ):
+                    st.session_state.confirm_clear_queue = False
+                    st.rerun()
+    else:
+        st.info("Queue is empty. Add URLs above to get started.")
 
-    # --- Processing Section ---
-    st.markdown("---")
-    st.markdown("### ⚙️ Processing Control")
+    # ---------------- 3. PROCESSING ----------------
+    st.markdown("#### Processing")
 
-    max_workers = st.slider("Max Concurrent Workers", min_value=1, max_value=8, value=3)
+    col_w, col_p = st.columns([1, 2])
+    with col_w:
+        max_workers = st.slider(
+            "Concurrent workers",
+            min_value=1, max_value=8, value=3,
+            help="More workers = faster, but increases risk of eBay rate-limiting.",
+            key="bq_workers",
+        )
 
     if not pending_items:
-        st.info("No pending items in the queue. Add URLs above to begin.")
+        with col_p:
+            st.info("No pending items. Add URLs above to start a batch run.")
         return
 
-    if st.button(f"🚀 Process {len(pending_items)} Pending Item(s)", type="primary"):
-        progress_bar = st.progress(0.0)
-        status_container = st.empty()
-        csv_lock = threading.Lock()
-        counter = {"success": 0, "fail": 0, "completed": 0}
-        total = len(pending_items)
+    with col_p:
+        process_btn = st.button(
+            f"Process all {len(pending_items)} pending item(s)",
+            type="primary",
+            use_container_width=True,
+            disabled=st.session_state.batch_processing,
+            key="bq_process_btn",
+        )
 
-        def process_one(url: str) -> None:
-            try:
-                update_queue_status(url, 'Processing')
-                result = scraper.scrape_product(url)
-                if result.success and result.product_data:
-                    folder_path = file_manager.create_product_folder(
-                        brand=result.product_data.brand,
-                        item_id=result.product_data.item_id,
-                        fallback_title=result.product_data.title,
-                    )
-                    file_manager.save_product_description_markdown(result.product_data, folder_path)
-                    file_manager.save_product_text(result.product_data, folder_path)
-                    file_manager.save_raw_scrape_text(result.product_data, folder_path)
-                    if result.image_urls:
-                        file_manager.download_images(scraper, result.image_urls, folder_path)
-                    with csv_lock:
-                        append_to_local_csv(result.product_data)
-                    update_queue_status(url, 'Done')
-                    counter["success"] += 1
-                else:
-                    msg = (result.error_message or 'Unknown error')[:200]
-                    update_queue_status(url, 'Error', error=msg)
-                    counter["fail"] += 1
-            except Exception as e:
-                logger.error(f"Batch worker error on {url}: {traceback.format_exc()}")
-                update_queue_status(url, 'Error', error=str(e)[:200])
-                counter["fail"] += 1
-            finally:
-                counter["completed"] += 1
-
-        urls_to_process = [it['url'] for it in pending_items]
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(process_one, u) for u in urls_to_process]
-            while not all(f.done() for f in futures):
-                progress_bar.progress(counter["completed"] / total)
-                status_container.info(
-                    f"Completed: {counter['completed']}/{total} | "
-                    f"Success: {counter['success']} | Failed: {counter['fail']}"
-                )
-                time.sleep(0.5)
-            progress_bar.progress(1.0)
-            status_container.success(
-                f"Batch Finished! Success: {counter['success']}, Failed: {counter['fail']}"
-            )
-
-        # Reload persisted queue to reflect statuses
+    if process_btn:
+        st.session_state.batch_processing = True
+        try:
+            _run_batch(scraper, file_manager, pending_items, max_workers)
+        finally:
+            st.session_state.batch_processing = False
         st.session_state.batch_queue = load_batch_queue()
-        st.toast("Batch processing completed!", icon="🎉")
-        time.sleep(1.5)
         st.rerun()
+
+
+def _report_add_result(added: int, dupes: int, invalid: int) -> None:
+    """Tell the user exactly what happened when they added URLs."""
+    parts = []
+    if added:
+        parts.append(f"added **{added}** new")
+    if dupes:
+        parts.append(f"skipped **{dupes}** already-queued")
+    if invalid:
+        parts.append(f"rejected **{invalid}** invalid")
+    summary = ", ".join(parts) if parts else "no changes"
+    if added:
+        st.success(f"Queue updated — {summary}.")
+    elif dupes and not invalid:
+        st.info(f"Nothing new — {summary}.")
+    elif invalid and not added:
+        st.warning(f"No valid eBay URLs found — {summary}.")
+    else:
+        st.info(summary.capitalize() + ".")
+
+
+def _run_batch(scraper: "EbayScraper", file_manager: "FileManager",
+               pending_items: List[Dict[str, Any]], max_workers: int) -> None:
+    """Run a single batch — extracted from render_batch_tab for clarity."""
+    progress_bar = st.progress(0.0)
+    status_container = st.empty()
+    csv_lock = threading.Lock()
+    counter = {"success": 0, "fail": 0, "completed": 0}
+    total = len(pending_items)
+
+    def process_one(url: str) -> None:
+        try:
+            update_queue_status(url, 'Processing')
+            result = scraper.scrape_product(url)
+            if result.success and result.product_data:
+                folder_path = file_manager.create_product_folder(
+                    brand=result.product_data.brand,
+                    item_id=result.product_data.item_id,
+                    fallback_title=result.product_data.title,
+                )
+                file_manager.save_product_description_markdown(result.product_data, folder_path)
+                file_manager.save_product_text(result.product_data, folder_path)
+                file_manager.save_raw_scrape_text(result.product_data, folder_path)
+                if result.image_urls:
+                    file_manager.download_images(scraper, result.image_urls, folder_path)
+                with csv_lock:
+                    append_to_local_csv(result.product_data)
+                update_queue_status(url, 'Done')
+                counter["success"] += 1
+            else:
+                msg = (result.error_message or 'Unknown error')[:200]
+                update_queue_status(url, 'Error', error=msg)
+                counter["fail"] += 1
+        except Exception as e:
+            logger.error(f"Batch worker error on {url}: {traceback.format_exc()}")
+            update_queue_status(url, 'Error', error=str(e)[:200])
+            counter["fail"] += 1
+        finally:
+            counter["completed"] += 1
+
+    urls_to_process = [it['url'] for it in pending_items]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_one, u) for u in urls_to_process]
+        while not all(f.done() for f in futures):
+            progress_bar.progress(counter["completed"] / total)
+            status_container.info(
+                f"Processed {counter['completed']}/{total} — "
+                f"success: {counter['success']}, failed: {counter['fail']}"
+            )
+            time.sleep(0.5)
+        progress_bar.progress(1.0)
+        if counter["fail"] == 0:
+            status_container.success(
+                f"Batch finished — {counter['success']} succeeded, 0 failed."
+            )
+        else:
+            status_container.warning(
+                f"Batch finished — {counter['success']} succeeded, {counter['fail']} failed. "
+                f"Click **Retry errors** above to re-queue them."
+            )
 
 
 # =============================================================================
@@ -2765,9 +2933,9 @@ def render_image_format_tab(file_manager: "FileManager") -> None:
     """Tab to bulk-convert .webp files in a chosen folder to another format."""
     st.markdown(
         """
-        <div style='margin-bottom: 1.5rem;'>
-            <h2 style='color: #000000; font-size: 1.75rem; font-weight: 700; margin-bottom: 0.25rem;'>Image Format</h2>
-            <p style='color: #6b7280; font-size: 1rem; margin: 0;'>Convert WebP images in a downloaded product folder to another format. Originals are replaced.</p>
+        <div class="es-card">
+            <div class="es-card-title">Image format conversion</div>
+            <p class="es-card-sub">Bulk-convert WebP images in a product folder to PNG, JPG, BMP or TIFF. Originals are replaced.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -2787,31 +2955,43 @@ def render_image_format_tab(file_manager: "FileManager") -> None:
     col_f, col_t = st.columns([2, 1])
     with col_f:
         idx = st.selectbox(
-            "Select folder (only folders with WebP images are listed)",
+            "Folder (only those containing WebP images are listed)",
             options=list(range(len(folders))),
             format_func=lambda i: folder_labels[i],
+            key="fmt_folder",
         )
     with col_t:
-        target = st.selectbox("Convert to", options=list(WEBP_TARGET_FORMATS.keys()), index=0)
+        target = st.selectbox(
+            "Convert to",
+            options=list(WEBP_TARGET_FORMATS.keys()),
+            index=0,
+            key="fmt_target",
+        )
 
     selected_folder = folders[idx]
     webp_files = [p for p in selected_folder.iterdir() if p.is_file() and p.suffix.lower() == '.webp']
     st.caption(f"Folder: `{selected_folder}` — found **{len(webp_files)}** webp file(s).")
 
     if webp_files:
-        with st.expander("Preview files to be converted", expanded=False):
+        with st.expander(f"Preview {len(webp_files)} file(s)", expanded=False):
             for wp in webp_files[:50]:
                 st.text(wp.name)
             if len(webp_files) > 50:
                 st.caption(f"...and {len(webp_files) - 50} more")
 
-    if st.button(f"🔁 Convert {len(webp_files)} WebP → {target}", type="primary", disabled=not webp_files):
+    if st.button(
+        f"Convert {len(webp_files)} WebP → {target}",
+        type="primary",
+        disabled=not webp_files,
+        use_container_width=True,
+        key="fmt_convert_btn",
+    ):
         with st.spinner("Converting..."):
             converted, failed, errors = convert_webp_in_folder(selected_folder, target)
         if converted:
-            st.success(f"✅ Converted {converted} image(s) to {target}. Originals removed.")
+            st.success(f"Converted {converted} image(s) to {target}. Originals removed.")
         if failed:
-            st.error(f"❌ {failed} image(s) failed to convert.")
+            st.error(f"{failed} image(s) failed to convert.")
             with st.expander("Show errors"):
                 for err in errors:
                     st.code(err, language=None)
@@ -3585,11 +3765,11 @@ def display_scraping_results(result: ScrapingResult, downloaded_images: List[str
     
     # Expandables for details
     st.write("")
-    with st.expander("📝 View Full Product Description", expanded=False):
+    with st.expander("Full description", expanded=False):
         st.markdown(pd.description or "*No description available*")
-    
+
     if pd.item_specifics:
-        with st.expander("📋 View Item Specifics", expanded=False):
+        with st.expander("Item specifics", expanded=False):
             # Create a clean grid layout for item specifics
             specifics_html = '<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem;">'
             
@@ -3609,15 +3789,14 @@ def display_scraping_results(result: ScrapingResult, downloaded_images: List[str
             
     # Quick Actions (e.g. Open Folder) - Streamlit can't easily open local folder on client side via button, 
     # but we can show the path text or provide a copy button.
-    st.success(f"📁 Data saved to: `{folder_path}`")
-    
+    st.success(f"Data saved to: `{folder_path}`")
+
     # Add open folder buttons if running locally
     col_open_1, col_open_2 = st.columns(2)
     with col_open_1:
-         # Zip download button logic could go here if implemented
          pass
     with col_open_2:
-        if st.button("📂 Open Folder", key=f"open_folder_{folder_path.name}"):
+        if st.button("Open folder", key=f"open_folder_{folder_path.name}"):
             try:
                 os.startfile(folder_path)
             except Exception:
@@ -3630,7 +3809,7 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
     """
     # Edge case: empty/whitespace input
     if not ebay_url or not ebay_url.strip():
-        st.error("⚠️ Please paste an eBay product URL before clicking Start scraping.")
+        st.error("Please paste an eBay product URL before clicking Start scraping.")
         return
 
     ebay_url = ebay_url.strip()
@@ -3736,7 +3915,7 @@ def main():
     try:
         scraper, file_manager = initialize_components()
     except Exception as e:
-        st.error(f"❌ Failed to initialize application: {e}")
+        st.error(f"Failed to initialize application: {e}")
         return
 
     # Sidebar: brand + navigation + configuration. The sidebar can be
@@ -3846,110 +4025,116 @@ def main():
     
     # Tab 3: AI Enhancement
     with tab3:
-        # Header
-        col_header_1, col_header_2 = st.columns([3, 1])
-        with col_header_1:
-            st.title("🤖 AI Content Studio")
-            st.caption("Generate platform-optimized descriptions and chat with your product data.")
-        
+        st.markdown(
+            """
+            <div class="es-card">
+                <div class="es-card-title">AI content studio</div>
+                <p class="es-card-sub">Generate platform-tuned descriptions from your scraped data, or chat with an assistant that knows the listing in context.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
         if not groq_api_key:
-            st.warning("⚠️ Please provide a Groq API key in the sidebar to use AI features.")
+            st.warning("Add a Groq API key in the sidebar to use the AI features.")
             st.stop()
-        
-        # Sub-tabs
-        ai_tab1, ai_tab2 = st.tabs(["📝 Content Generator", "💬 AI Assistant"])
-        
+
+        ai_tab1, ai_tab2 = st.tabs(["Content generator", "AI assistant"])
+
         # --- TAB 1: Content Generator ---
         with ai_tab1:
             product_folders = file_manager.get_existing_product_folders()
-            
+
             if not product_folders:
-                st.info("📂 No scraped products found. Go to the Single Product tab to scrape some data first.")
+                st.info("No scraped products yet. Open the Single Product or Batch Processing tab to scrape some data first.")
             else:
-                # Layout: Input Sidebar (Left) vs Output (Right)
                 col_input, col_output = st.columns([1, 1.5], gap="large")
-                
+
                 with col_input:
-                    st.markdown("### 1. Select Content")
-                    
-                    # Smart Selection Logic
+                    st.markdown("**1. Select content**")
                     folder_names = [f["folder_name"] for f in product_folders]
-                    selected_folder_name = st.selectbox("Product Folder", folder_names)
-                    
+                    selected_folder_name = st.selectbox("Product folder", folder_names, key="ai_folder")
+
                     folder_info = next((f for f in product_folders if f["folder_name"] == selected_folder_name), None)
-                    
+
                     selected_file = None
                     if folder_info:
                         files = folder_info.get("text_files", [])
-                        # Auto-select 'raw_scrape.txt' if available, else first file
-                        default_idx = next((i for i, f in enumerate(files) if "raw_scrape.txt" in f), 0)
-                        selected_file = st.selectbox("Source File", files, index=default_idx)
-                    
-                    st.markdown("### 2. Configure")
+                        if files:
+                            default_idx = next((i for i, f in enumerate(files) if "raw_scrape.txt" in f), 0)
+                            selected_file = st.selectbox("Source file", files, index=default_idx, key="ai_file")
+                        else:
+                            st.warning("This folder has no text files. Re-scrape the product.")
+
+                    st.markdown("**2. Configure**")
                     target_platform = st.selectbox(
-                        "Target Platform",
-                        ["General", "eBay", "Poshmark", "Mercari", "Depop", "Etsy", "Facebook Marketplace", "Shopify", "Vinted", "Grailed"],
-                        help="Optimizes tone, structure, and length for this platform."
+                        "Target platform",
+                        ["General", "eBay", "Poshmark", "Mercari", "Depop", "Etsy", "Facebook Marketplace", "Shopify", "Vinted", "Grailed", "Vestiaire Collective", "Leboncoin", "Instagram"],
+                        help="Tone, structure and length are optimised for this marketplace.",
+                        key="ai_platform",
                     )
-                    
-                    with st.expander("Advanced Instructions", expanded=False):
+
+                    with st.expander("Advanced instructions", expanded=False):
                         custom_instructions = st.text_area(
-                            "Custom Rules",
-                            placeholder="e.g. 'Use emojis', 'Focus on flaws', 'Short & punchy'",
-                            height=80
+                            "Custom rules",
+                            placeholder="e.g. 'no emojis', 'focus on flaws', 'short & punchy'",
+                            height=80,
+                            key="ai_custom",
                         )
-                    
-                    st.divider()
-                    
-                    generate_btn = st.button("✨ Generate Description", type="primary", use_container_width=True)
-                
+
+                    generate_btn = st.button(
+                        "Generate description",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=not (folder_info and selected_file),
+                        key="ai_generate_btn",
+                    )
+
                 with col_output:
-                    st.markdown("### 3. Result")
-                    # Placeholder or Result
+                    st.markdown("**3. Result**")
                     if "ai_generated_result" not in st.session_state:
-                         st.session_state.ai_generated_result = None
-                    
+                        st.session_state.ai_generated_result = None
+
                     if generate_btn and folder_info and selected_file:
                         try:
-                            # Load Content
                             original_content = file_manager.load_product_text(folder_info["folder_path"], selected_file)
                             if not original_content:
-                                st.error("Empty source file.")
+                                st.error("Source file is empty.")
                             else:
-                                with st.spinner(f"🔍 Analyzing and rewriting for {target_platform}..."):
+                                with st.spinner(f"Rewriting for {target_platform}..."):
                                     groq_processor = GroqProcessor(groq_api_key)
                                     result_text = groq_processor.platform_agent.generate_platform_description(
                                         raw_text=original_content,
-                                        product_data=None, # Loading full object is harder here, raw text is usually enough
+                                        product_data=None,
                                         platform=target_platform,
-                                        custom_instructions=custom_instructions
+                                        custom_instructions=custom_instructions,
                                     )
                                     st.session_state.ai_generated_result = {
                                         "text": result_text,
                                         "platform": target_platform,
-                                        "timestamp": datetime.now().strftime("%H:%M")
+                                        "timestamp": datetime.now().strftime("%H:%M"),
                                     }
-                                    
-                                    # Save to file
                                     out_name = f"{selected_folder_name}_{target_platform}_listing.txt"
                                     out_path = Path(folder_info["folder_path"]) / out_name
                                     with open(out_path, 'w', encoding='utf-8') as f:
                                         f.write(result_text)
-                                    st.toast(f"Saved to {out_name}", icon="💾")
-                                    
+                                    st.toast(f"Saved to {out_name}")
                         except Exception as e:
                             st.error(f"Generation failed: {e}")
-                    
-                    # Display Result
+
                     res = st.session_state.ai_generated_result
                     if res:
-                        st.markdown(f"**Generated for {res['platform']} at {res['timestamp']}**")
-                        st.text_area("Final Output", value=res['text'], height=500)
-                        col_d1, col_d2 = st.columns(2)
-                        with col_d1:
-                            st.download_button("📥 Download .txt", data=res['text'], file_name=f"listing_{res['platform']}.txt")
+                        st.caption(f"Generated for **{res['platform']}** at {res['timestamp']}")
+                        st.text_area("Output", value=res['text'], height=420, key="ai_result_area")
+                        st.download_button(
+                            "Download .txt",
+                            data=res['text'],
+                            file_name=f"listing_{res['platform']}.txt",
+                            use_container_width=False,
+                            key="ai_download",
+                        )
                     else:
-                        st.info("👈 Select a product and click Generate to see the magic happen.")
+                        st.info("Select a product on the left and click **Generate description**.")
         
         # AI Tab 2: ChatGPT-style Chatbot with streaming
         with ai_tab2:
@@ -4123,57 +4308,51 @@ def main():
 
         # --- TAB 2: AI Assistant (Native UI) ---
         with ai_tab2:
-            # 1. Context Manager (Top Bar)
             with st.container():
                 c1, c2 = st.columns([1, 2])
                 with c1:
-                    st.markdown("### 🤖 AI Assistant")
+                    st.markdown("**Assistant**")
                 with c2:
-                    # Compact context selector
                     product_folders = file_manager.get_existing_product_folders()
-                    context_options = ["General (No Context)"] + [f["folder_name"] for f in product_folders]
-                    
+                    context_options = ["General (no context)"] + [f["folder_name"] for f in product_folders]
                     selected_context = st.selectbox(
-                        "Product Context",
+                        "Product context",
                         options=context_options,
                         label_visibility="collapsed",
-                        help="Select a product to chat about"
+                        help="Pick a scraped product to ground the conversation in.",
+                        key="ai_chat_context",
                     )
 
-            st.divider()
-
-            # 2. Chat Logic
             if "chat_sessions" not in st.session_state:
                 st.session_state.chat_sessions = {0: {"messages": []}}
                 st.session_state.active_session = 0
-            
+
             session = st.session_state.chat_sessions[st.session_state.active_session]
-            
-            # Welcome Screen (if empty)
+
             if not session['messages']:
-                st.markdown("""
-                <div style='text-align: center; margin: 3rem 0; color: #4b5563;'>
-                    <h3>👋 How can I help you?</h3>
-                    <p>I can rewrite descriptions, analyze prices, or give you marketing ideas.</p>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                # Preset Questions
+                st.markdown(
+                    """
+                    <div style='text-align: center; margin: 2rem 0 1.5rem; color: #475569;'>
+                        <h3 style='margin: 0 0 0.25rem;'>How can I help?</h3>
+                        <p style='margin: 0; color: #64748b;'>I can rewrite descriptions, analyse pricing or suggest SEO tags.</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
                 col_q1, col_q2, col_q3 = st.columns(3)
                 with col_q1:
-                    if st.button("📝 Rewrite Description", use_container_width=True):
-                        # We can't auto-submit to chat_input easily in Streamlit, 
-                        # so we append to history to trigger "simulated" user message
-                         session['messages'].append({"user": "Rewrite the current product description to be more professional.", "assistant": None})
-                         st.rerun()
+                    if st.button("Rewrite description", use_container_width=True, key="chat_preset_rewrite"):
+                        session['messages'].append({"user": "Rewrite the current product description to be more professional.", "assistant": None})
+                        st.rerun()
                 with col_q2:
-                    if st.button("📊 Price Analysis", use_container_width=True):
-                         session['messages'].append({"user": "Analyze the pricing strategy for this item.", "assistant": None})
-                         st.rerun()
+                    if st.button("Price analysis", use_container_width=True, key="chat_preset_price"):
+                        session['messages'].append({"user": "Analyse the pricing strategy for this item.", "assistant": None})
+                        st.rerun()
                 with col_q3:
-                     if st.button("🏷️ Generate Tags", use_container_width=True):
-                         session['messages'].append({"user": "Suggest 10 relevant SEO tags for this product.", "assistant": None})
-                         st.rerun()
+                    if st.button("Generate SEO tags", use_container_width=True, key="chat_preset_tags"):
+                        session['messages'].append({"user": "Suggest 10 relevant SEO tags for this product.", "assistant": None})
+                        st.rerun()
 
             # Display History
             for msg in session['messages']:
@@ -4192,9 +4371,9 @@ def main():
                         
                         col_copy, col_spacer = st.columns([1, 5])
                         with col_copy:
-                            if st.button("📋 Copy", key=copy_key + "_btn", type="secondary"):
+                            if st.button("Copy", key=copy_key + "_btn", type="secondary"):
                                 st.session_state[copy_key] = True
-                                st.toast("✅ Copied to clipboard!", icon="✅")
+                                st.toast("Copied to clipboard")
                         
                         # Show the copyable text in an expander if user wants to manually copy
                         if st.session_state[copy_key]:
@@ -4493,16 +4672,17 @@ def main():
 
     # Tab 4: Image Enhancement
     with tab4:
-        # Clean modern header
-        st.markdown("""
-        <div style='margin-bottom: 2rem;'>
-            <h2 style='color: #000000; font-size: 1.75rem; font-weight: 700; margin-bottom: 0.5rem;'>Image Enhancement</h2>
-            <p style='color: #6b7280; font-size: 1rem; margin: 0;'>Select a folder, choose images, adjust enhancements, and optionally add your logo.</p>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            """
+            <div class="es-card">
+                <div class="es-card-title">Image enhancement</div>
+                <p class="es-card-sub">Adjust brightness, contrast, sharpness and saturation, optionally watermark with a logo, and export to a sub-folder.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        # Folder selection via dropdowns for better UX
-        st.markdown("<h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 1rem; margin-top: 1.5rem;'>📁 Select Folders</h3>", unsafe_allow_html=True)
+        st.markdown("#### Select folders")
         col_folder, col_logo = st.columns([2, 1])
         with col_folder:
             # Offer common folders under downloads plus manual typing
@@ -4535,13 +4715,8 @@ def main():
                 except Exception as e:
                     st.error(f"Error loading logo: {e}")
 
-        # Quick Presets Section
-        st.markdown("""
-        <div style='margin-top: 2rem; margin-bottom: 1rem;'>
-            <h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem;'>⚡ Quick Presets</h3>
-            <p style='color: #6b7280; font-size: 0.9rem; margin: 0;'>One-click settings for common use cases</p>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown("#### Quick presets")
+        st.caption("One-click settings for common use cases.")
         
         # Initialize session state for preset values
         if 'img_brightness' not in st.session_state:
@@ -4552,59 +4727,49 @@ def main():
         
         col_preset1, col_preset2, col_preset3, col_preset4 = st.columns(4)
         with col_preset1:
-            if st.button("🛒 eBay Ready", use_container_width=True, help="Clean, bright images for eBay listings"):
+            if st.button("eBay ready", use_container_width=True, help="Clean, bright images for eBay listings", key="preset_ebay"):
                 st.session_state.img_brightness = 1.10
                 st.session_state.img_contrast = 1.15
                 st.session_state.img_sharpness = 1.20
                 st.session_state.img_saturation = 1.05
                 st.rerun()
         with col_preset2:
-            if st.button("📸 Instagram", use_container_width=True, help="Vibrant, eye-catching images for social"):
+            if st.button("Instagram", use_container_width=True, help="Vibrant, eye-catching images for social", key="preset_ig"):
                 st.session_state.img_brightness = 1.05
                 st.session_state.img_contrast = 1.20
                 st.session_state.img_sharpness = 1.15
                 st.session_state.img_saturation = 1.25
                 st.rerun()
         with col_preset3:
-            if st.button("✨ Professional", use_container_width=True, help="Neutral, premium look"):
+            if st.button("Professional", use_container_width=True, help="Neutral, premium look", key="preset_pro"):
                 st.session_state.img_brightness = 1.02
                 st.session_state.img_contrast = 1.08
                 st.session_state.img_sharpness = 1.25
                 st.session_state.img_saturation = 0.98
                 st.rerun()
         with col_preset4:
-            if st.button("🔄 Reset", use_container_width=True, help="Reset to default values"):
+            if st.button("Reset", use_container_width=True, help="Reset to default values", key="preset_reset"):
                 st.session_state.img_brightness = 1.0
                 st.session_state.img_contrast = 1.0
                 st.session_state.img_sharpness = 1.0
                 st.session_state.img_saturation = 1.0
                 st.rerun()
 
-        # Enhancement Settings Section (Manual Fine-tuning)
-        st.markdown("""
-        <div style='margin-top: 2rem; margin-bottom: 1rem;'>
-            <h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem;'>🎨 Fine-tune Settings</h3>
-            <p style='color: #6b7280; font-size: 0.9rem; margin: 0;'>Manually adjust brightness, contrast, sharpness, and saturation</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
+        st.markdown("#### Fine-tune")
+        st.caption("Adjust brightness, contrast, sharpness and saturation manually.")
+
         col_b, col_c, col_s, col_sat = st.columns(4)
         with col_b:
-            brightness = st.slider("☀️ Brightness", 0.1, 2.5, st.session_state.img_brightness, 0.01, key="brightness_slider")
+            brightness = st.slider("Brightness", 0.1, 2.5, st.session_state.img_brightness, 0.01, key="brightness_slider")
         with col_c:
-            contrast = st.slider("◐ Contrast", 0.1, 2.5, st.session_state.img_contrast, 0.01, key="contrast_slider")
+            contrast = st.slider("Contrast", 0.1, 2.5, st.session_state.img_contrast, 0.01, key="contrast_slider")
         with col_s:
-            sharpness = st.slider("🔍 Sharpness", 0.1, 3.0, st.session_state.img_sharpness, 0.01, key="sharpness_slider")
+            sharpness = st.slider("Sharpness", 0.1, 3.0, st.session_state.img_sharpness, 0.01, key="sharpness_slider")
         with col_sat:
-            saturation = st.slider("🎨 Saturation", 0.1, 2.5, st.session_state.img_saturation, 0.01, key="saturation_slider")
+            saturation = st.slider("Saturation", 0.1, 2.5, st.session_state.img_saturation, 0.01, key="saturation_slider")
 
-        # Logo Watermark Settings Section
-        st.markdown("""
-        <div style='margin-top: 2rem; margin-bottom: 1rem;'>
-            <h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem;'>🏷️ Logo Watermark Settings</h3>
-            <p style='color: #6b7280; font-size: 0.9rem; margin: 0;'>Configure logo size, position, and opacity</p>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown("#### Logo watermark")
+        st.caption("Configure logo size, position and opacity.")
         
         col_logo1, col_logo2, col_logo3 = st.columns(3)
         with col_logo1:
@@ -4619,12 +4784,7 @@ def main():
         with col_logo3:
             logo_opacity = st.slider("Logo Opacity", 0.1, 1.0, 1.0, 0.05)
 
-        # Image Selection Section
-        st.markdown("""
-        <div style='margin-top: 2rem; margin-bottom: 1rem;'>
-            <h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem;'>🖼️ Image Selection</h3>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown("#### Image selection")
 
         # List images in folder
         image_files = []
@@ -4636,17 +4796,9 @@ def main():
             image_files = []
 
         if not image_files:
-            st.markdown("""
-            <div style='background: #eff6ff; padding: 1rem 1.25rem; border-radius: 8px; border-left: 4px solid #3b82f6; margin: 1rem 0;'>
-                <p style='color: #000000; margin: 0; font-size: 0.95rem;'>📂 No images found in the specified folder.</p>
-            </div>
-            """, unsafe_allow_html=True)
+            st.info("No images found in the selected folder.")
         else:
-            st.markdown(f"""
-            <div style='background: #f0fdf4; padding: 1rem 1.25rem; border-radius: 8px; border-left: 4px solid #10b981; margin: 1rem 0;'>
-                <p style='color: #000000; margin: 0; font-size: 0.95rem; font-weight: 600;'>✅ Found {len(image_files)} images ready to process</p>
-            </div>
-            """, unsafe_allow_html=True)
+            st.success(f"Found {len(image_files)} images ready to process.")
             
             file_names = [p.name for p in image_files]
             selections = st.multiselect("Select images to process", options=file_names, default=file_names)
@@ -4656,9 +4808,9 @@ def main():
             st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
             col_process, col_preview = st.columns([1, 1])
             with col_process:
-                process_btn = st.button("🚀 Enhance Selected Images", type="primary", use_container_width=True)
+                process_btn = st.button("Enhance selected images", type="primary", use_container_width=True, key="img_enhance_btn")
             with col_preview:
-                preview_btn = st.button("👁️ Preview Settings", type="secondary", use_container_width=True)
+                preview_btn = st.button("Preview settings", type="secondary", use_container_width=True, key="img_preview_btn")
             
             # Preview functionality
             if preview_btn and selections:
@@ -4719,8 +4871,8 @@ def main():
                     progress_bar.progress(1.0)
                     status_text.text("Processing complete!")
                     
-                    st.success(f"✅ Successfully processed {len(processed_paths)} images!")
-                    st.info(f"📁 Output folder: {output_root}")
+                    st.success(f"Successfully processed {len(processed_paths)} image(s).")
+                    st.caption(f"Output folder: `{output_root}`")
                     
                     # Show sample of processed images
                     if processed_paths:
@@ -4734,7 +4886,7 @@ def main():
                                         pass
                                         
                 except Exception as e:
-                    st.error(f"❌ Image enhancement error: {e}")
+                    st.error(f"Image enhancement error: {e}")
                     logger.error(f"Image enhancement error: {traceback.format_exc()}")
 
     # Tab: Image Format (WebP conversion)
@@ -4825,7 +4977,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        st.error(f"❌ Application error: {e}")
+        st.error(f"Application error: {e}")
         logger.critical(f"Application startup error: {traceback.format_exc()}")
         
         # Show error details in debug mode
