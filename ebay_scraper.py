@@ -25,7 +25,7 @@ from io import StringIO
 import pandas as pd
 import time
 import random
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs
 from pathlib import Path
 import json
 from datetime import datetime
@@ -136,31 +136,151 @@ class PlatformAgent:
         self.model = groq_model
         self.cache = cache
         
-        # Platform knowledge base
+        # Platform knowledge base - researched per-marketplace listing requirements
         self.platforms = {
             "leboncoin": {
                 "name": "Leboncoin",
                 "language": "French",
-                "style": "Casual, direct, local-focused",
+                "style": "Casual, direct, local-focused, no exaggerated claims",
                 "key_features": ["Price visibility", "Local pickup options", "Honest condition description"],
                 "title_length": 50,
-                "description_style": "Short paragraphs, clear bullet points"
+                "max_description_chars": 1500,
+                "required_fields": ["état", "marque", "taille", "couleur", "ville/code postal"],
+                "tone_rules": "Plain French, no emojis, no all-caps. Mention local pickup and shipping options.",
+                "description_style": "Short paragraphs, clear bullet points, end with delivery options.",
+                "must_avoid": ["external links", "phone numbers in description", "promotional language"]
             },
             "vinted": {
                 "name": "Vinted",
-                "language": "English/French",
-                "style": "Friendly, fashion-forward, community-oriented",
-                "key_features": ["Size/fit details", "Brand emphasis", "Styling suggestions"],
+                "language": "Buyer's local language (EN/FR/DE/ES/IT/PL)",
+                "style": "Friendly, fashion-forward, community-oriented, lowercase ok",
+                "key_features": ["Brand", "Size (with size system EU/UK/US)", "Material composition", "Condition (new with tags / very good / good / satisfactory)", "Measurements (pit-to-pit, length, waist, inseam)"],
                 "title_length": 60,
-                "description_style": "Conversational, includes measurements and styling tips"
+                "max_description_chars": 1500,
+                "required_fields": ["brand", "size", "condition", "color", "material", "category"],
+                "tone_rules": "Warm and casual. 1-3 light emojis allowed. Mention bundle discounts and fast shipping. Be transparent about flaws.",
+                "description_style": "Short intro about the item, bullet list of measurements/materials, honest condition note, closing line with bundling/shipping info. Add 5-10 relevant hashtags at the bottom (#brand #y2k #vintage).",
+                "must_avoid": ["counterfeit claims", "external links", "personal contact info", "price negotiation outside Vinted"]
             },
             "vestiaire collective": {
                 "name": "Vestiaire Collective",
-                "language": "English/French",
-                "style": "Luxury, professional, authentication-focused",
-                "key_features": ["Authenticity proof", "Precise measurements", "Condition grading"],
+                "language": "English (primary) or French",
+                "style": "Luxury, professional, authentication-focused, formal tone",
+                "key_features": ["Authenticity proof", "Serial/date code", "Original packaging (dust bag, box, receipt)", "Precise measurements in cm", "Condition grading (Never worn / Very good / Good / Fair)", "Provenance/year of purchase"],
                 "title_length": 100,
-                "description_style": "Detailed, professional, includes provenance"
+                "max_description_chars": 3000,
+                "required_fields": ["brand", "model name", "material", "color", "size", "year of purchase", "condition grade"],
+                "tone_rules": "Formal, third-person, factual. No emojis, no hashtags, no exclamations. Focus on craftsmanship and authenticity.",
+                "description_style": "1) Item summary (brand, model, year). 2) Materials and craftsmanship. 3) Exact measurements in cm. 4) Condition with specific flaws. 5) Included accessories. 6) Provenance.",
+                "must_avoid": ["price comparisons to retail", "urgency phrasing", "emojis", "informal slang"]
+            },
+            "depop": {
+                "name": "Depop",
+                "language": "English",
+                "style": "Gen-Z, trendy, aesthetic, hashtag-heavy",
+                "key_features": ["Aesthetic/style tags (y2k, grunge, cottagecore)", "Brand & era", "Size (listed and measured)", "Vibe descriptors", "Hashtags (up to 5 used by algorithm)"],
+                "title_length": 65,
+                "max_description_chars": 1000,
+                "required_fields": ["brand", "size", "condition", "color", "category", "5 hashtags"],
+                "tone_rules": "Trendy, lowercase friendly, emojis welcome (2-4). Use aesthetic terms. Mention model size for fit reference if relevant.",
+                "description_style": "Hook line with vibe → key details (brand, size, condition) → measurements → end with 5 hashtags. Keep it scannable.",
+                "must_avoid": ["walls of text", "boring corporate tone", "external links"]
+            },
+            "poshmark": {
+                "name": "Poshmark",
+                "language": "English (US)",
+                "style": "Boutique, upbeat, retail-style",
+                "key_features": ["Brand", "Size (US sizing)", "Color", "Condition", "Original retail price", "Smoke-free/pet-free home note"],
+                "title_length": 80,
+                "max_description_chars": 1500,
+                "required_fields": ["brand", "size", "category", "color", "condition", "NWT/EUC/GUC code"],
+                "tone_rules": "Boutique-style. NWT (New With Tags), EUC (Excellent Used Condition), GUC (Good Used Condition) abbreviations expected. Light emojis ok.",
+                "description_style": "Title line → bullet list (brand, size, material, measurements) → condition note → closing line (bundle discount, ships next day). Add 3-5 relevant hashtags.",
+                "must_avoid": ["off-platform contact", "trade requests in title", "misleading sizing"]
+            },
+            "mercari": {
+                "name": "Mercari",
+                "language": "English (US)",
+                "style": "Clean, factual, search-keyword optimized",
+                "key_features": ["Brand", "Size", "Color", "Material", "Condition (New / Like new / Good / Fair / Poor)", "Shipping weight"],
+                "title_length": 80,
+                "max_description_chars": 1000,
+                "required_fields": ["brand", "category", "condition", "size/dimensions", "weight"],
+                "tone_rules": "Direct and keyword-heavy for search. No fluff, no emojis required. Front-load brand and key specs in title.",
+                "description_style": "Title front-loaded with brand+keyword. Description: bulleted specs, condition disclosure, dimensions, shipping notes (smoke-free home, ships within 1 business day).",
+                "must_avoid": ["external links", "vague condition", "missing dimensions"]
+            },
+            "etsy": {
+                "name": "Etsy",
+                "language": "English",
+                "style": "Story-driven, handmade/vintage focus, SEO-rich",
+                "key_features": ["Era/year for vintage", "Materials", "Dimensions", "Care instructions", "Handmade vs vintage vs craft supply", "13 tags max for SEO"],
+                "title_length": 140,
+                "max_description_chars": 5000,
+                "required_fields": ["category", "materials", "dimensions", "production type (handmade/vintage)", "13 SEO tags"],
+                "tone_rules": "Warm, storytelling, evocative. Front-load primary keyword + descriptor in first 40 chars of title for SEO.",
+                "description_style": "Opening hook → materials and dimensions → backstory/inspiration → care instructions → shipping/processing time → return policy. Include FAQ at the end.",
+                "must_avoid": ["mass-produced claims labeled handmade", "external shop links", "trademarked terms"]
+            },
+            "grailed": {
+                "name": "Grailed",
+                "language": "English",
+                "style": "Streetwear/menswear connoisseur, brand-savvy",
+                "key_features": ["Designer/brand (capitalized correctly)", "Season/year (SS18, FW20)", "Collection name", "Size (chest, waist, length in inches)", "Tagged size", "Condition (10/10 scale common)"],
+                "title_length": 60,
+                "max_description_chars": 1000,
+                "required_fields": ["designer", "department", "category", "size", "color", "condition"],
+                "tone_rules": "Knowledgeable, no fluff. Use correct collection/season codes. Mention provenance for hype items. No emojis.",
+                "description_style": "Designer + collection + piece type → measurements in inches (P2P, length, shoulder, sleeve) → condition with any flaws called out → reason for sale optional.",
+                "must_avoid": ["fake season codes", "wrong designer spelling", "overpriced anchoring"]
+            },
+            "facebook marketplace": {
+                "name": "Facebook Marketplace",
+                "language": "English (US/UK)",
+                "style": "Local, conversational, pickup-friendly",
+                "key_features": ["Location/pickup area", "Condition", "Local pickup vs shipping", "Cash/Venmo accepted", "Bundle deals", "Dimensions for furniture"],
+                "title_length": 100,
+                "max_description_chars": 5000,
+                "required_fields": ["category", "condition", "location", "price"],
+                "tone_rules": "Friendly and conversational. Mention 'pickup in [neighborhood]'. Light emojis ok. Say 'first come first served' or 'serious buyers only' as appropriate.",
+                "description_style": "Item + condition → why selling (moving, upgraded, etc.) → dimensions → pickup details → preferred payment.",
+                "must_avoid": ["prohibited items", "trades unless specified", "vague location"]
+            },
+            "ebay": {
+                "name": "eBay",
+                "language": "English",
+                "style": "Professional retailer, search-optimized, detail-rich",
+                "key_features": ["Brand/MPN/UPC", "Exact model number", "Item specifics (every field filled)", "Condition with detailed notes", "Shipping policy", "Returns policy", "Authentication for high-value"],
+                "title_length": 80,
+                "max_description_chars": 4000,
+                "required_fields": ["brand", "MPN", "model", "size/dimensions", "color", "material", "condition", "country of manufacture"],
+                "tone_rules": "Professional, third-person, no all-caps in title (eBay penalizes). Pack keywords into the 80-char title without keyword-stuffing.",
+                "description_style": "Title with brand+model+key spec → bulleted feature list → detailed condition (call out every flaw, include photos referenced as 'see photos') → shipping & handling → returns. Use HTML-friendly line breaks.",
+                "must_avoid": ["misleading titles", "competitor brand keywords in title (keyword spamming = listing removal)", "external links"]
+            },
+            "shopify": {
+                "name": "Shopify Store",
+                "language": "English",
+                "style": "Brand-voice driven, conversion-focused",
+                "key_features": ["Product benefit headline", "Bullet feature list", "Detailed spec table", "SEO meta description (155 chars)", "Schema-ready details"],
+                "title_length": 70,
+                "max_description_chars": 5000,
+                "required_fields": ["product title", "vendor", "type", "tags", "SKU", "weight", "dimensions"],
+                "tone_rules": "Brand-consistent. Lead with the customer benefit, not the feature. Strong CTA at the end.",
+                "description_style": "Benefit headline → 3-5 feature bullets (benefit-led) → specs table → social proof if available → shipping & return note. Add 155-char SEO meta separately.",
+                "must_avoid": ["raw scraped text", "generic phrasing", "missing alt-text suggestions"]
+            },
+            "instagram": {
+                "name": "Instagram",
+                "language": "English",
+                "style": "Visual-first caption, hook-led, hashtag-rich",
+                "key_features": ["Hook (first line)", "Story/CTA", "15-25 hashtags", "Emojis", "Link-in-bio reference"],
+                "title_length": 30,
+                "max_description_chars": 2200,
+                "required_fields": ["hook", "CTA", "hashtags"],
+                "tone_rules": "Punchy hook. Conversational body. 15-25 relevant hashtags grouped at the bottom or in first comment.",
+                "description_style": "Line 1 hook → emoji-led body → CTA (link in bio / DM to buy) → blank line → hashtag block.",
+                "must_avoid": ["banned hashtags", "all-caps", "more than 30 hashtags (algorithm penalty)"]
             },
             "general": {
                 "name": "General Marketplace",
@@ -168,14 +288,35 @@ class PlatformAgent:
                 "style": "Professional, clear, informative",
                 "key_features": ["Complete specs", "Clear photos", "Honest description"],
                 "title_length": 80,
-                "description_style": "Structured with clear sections"
+                "max_description_chars": 2000,
+                "required_fields": ["brand", "size", "condition", "category"],
+                "tone_rules": "Professional and clear. Adapt to context.",
+                "description_style": "Structured with clear sections: overview, specs, condition, shipping.",
+                "must_avoid": ["misleading claims", "external links"]
             }
         }
     
     def research_platform(self, platform_name: str) -> Dict:
-        """Get platform-specific requirements and best practices."""
-        normalized = platform_name.lower().replace(" ", "_")
-        return self.platforms.get(normalized, self.platforms["general"])
+        """Get platform-specific requirements and best practices.
+        Matches loosely on lowercase, ignoring spaces/underscores/hyphens."""
+        if not platform_name:
+            return self.platforms["general"]
+        target = re.sub(r'[\s_\-]+', '', platform_name.lower())
+        for key, val in self.platforms.items():
+            if re.sub(r'[\s_\-]+', '', key.lower()) == target:
+                return val
+        # Common aliases
+        aliases = {
+            'vc': 'vestiaire collective',
+            'fb': 'facebook marketplace',
+            'facebook': 'facebook marketplace',
+            'marketplace': 'facebook marketplace',
+            'ig': 'instagram',
+            'insta': 'instagram',
+        }
+        if target in aliases:
+            return self.platforms.get(aliases[target], self.platforms["general"])
+        return self.platforms["general"]
     
     def generate_platform_description(self, raw_text: str, product_data: Optional[Any], 
                                      platform: str, custom_instructions: str = "") -> str:
@@ -206,10 +347,15 @@ class PlatformAgent:
                 condition = getattr(product_data, 'condition', '')
                 specs = getattr(product_data, 'item_specifics', {})
             
-            prompt = f"""
-You are an expert product listing writer for {platform_info['name']}.
+            required_fields = platform_info.get('required_fields', [])
+            tone_rules = platform_info.get('tone_rules', '')
+            must_avoid = platform_info.get('must_avoid', [])
+            max_chars = platform_info.get('max_description_chars', 2000)
 
-TASK: Create a clean, professional product description optimized for {platform_info['name']}.
+            prompt = f"""
+You are an expert product listing writer for {platform_info['name']}. You know this platform's algorithm, audience and unwritten rules.
+
+TASK: Produce a ready-to-publish listing optimized for {platform_info['name']}. No commentary, no preface — just the final listing.
 
 INPUT DATA:
 Title: {title}
@@ -217,37 +363,34 @@ Brand: {brand}
 Condition: {condition}
 Specifications: {json.dumps(specs, ensure_ascii=False)}
 
-RAW TEXT (may contain noise - extract only relevant product information):
+RAW TEXT (may contain noise like nav menus, similar-item lists, seller banners — extract only the real product information):
 {raw_text}
 
-PLATFORM REQUIREMENTS:
+PLATFORM PROFILE — {platform_info['name']}:
 - Language: {platform_info['language']}
-- Style: {platform_info['style']}
-- Title length: ~{platform_info['title_length']} characters
-- Description style: {platform_info['description_style']}
-- Key features to highlight: {', '.join(platform_info['key_features'])}
+- Audience & style: {platform_info['style']}
+- Title length target: ~{platform_info['title_length']} characters (hard ceiling)
+- Description ceiling: ~{max_chars} characters
+- Required fields to address explicitly: {', '.join(required_fields) if required_fields else 'standard'}
+- Key features this platform's buyers care about: {', '.join(platform_info['key_features'])}
+- Tone rules: {tone_rules}
+- Description structure: {platform_info['description_style']}
+- Must AVOID on this platform: {', '.join(must_avoid) if must_avoid else 'none'}
 
-{f"CUSTOM INSTRUCTIONS: {custom_instructions}" if custom_instructions else ""}
+{f"USER CUSTOM INSTRUCTIONS (override defaults where they conflict): {custom_instructions}" if custom_instructions else ""}
 
-RULES:
-1. **NO raw data headers** - Don't include "Product Information", "Title:", "Price:", etc.
-2. **Clean title only** - Write a compelling SEO-optimized title
-3. **Structured description** - Use clear sections with headings
-4. **Remove noise** - No seller info, shipping banners, similar items, ads
-5. **Factual only** - Don't invent details not in the source
-6. **Proper formatting** - Use line breaks and bullet points for readability
-7. **Include measurements** - Keep exact dimensions, sizes, materials
-8. **Condition details** - Be honest about any flaws or wear
-9. **Platform tone** - Match the platform's typical listing style
+HARD RULES:
+1. Output ONLY the listing. No "Here is your listing", no markdown headers like "# Title".
+2. First line = the optimized TITLE (no quotes, no prefix). Blank line. Then the description.
+3. Never invent specs, measurements, materials, or provenance that aren't in the source. If unknown, omit.
+4. Strip noise: nav links, "similar items", "people also viewed", seller promo, breadcrumbs, eBay/site chrome.
+5. Keep every concrete number from the source (cm, in, kg, size, year).
+6. Be honest about flaws — call them out in the platform's expected phrasing.
+7. Match the platform tone exactly. Casual platforms get casual; luxury platforms stay formal.
+8. Address each required field if the source provides it.
+9. Output language: write in {platform_info['language']}.
 
-OUTPUT FORMAT (plain text, no markdown):
-[Write an optimized title on first line]
-
-[Blank line]
-
-[Well-structured description with clear sections]
-
-IMPORTANT: Start directly with the title. No headers like "Product Information" or field labels.
+Begin the output now with the title on the first line.
 """
             
             # Check cache first
@@ -470,40 +613,105 @@ class EbayScraper:
         self.session.headers.update(REQUEST_HEADERS)
         logger.info("eBay scraper initialized")
     
+    # Known eBay regional domains and short link hosts
+    EBAY_DOMAINS = (
+        'ebay.com', 'ebay.co.uk', 'ebay.de', 'ebay.fr', 'ebay.it', 'ebay.es',
+        'ebay.com.au', 'ebay.ca', 'ebay.at', 'ebay.be', 'ebay.ch', 'ebay.ie',
+        'ebay.nl', 'ebay.pl', 'ebay.com.hk', 'ebay.com.sg', 'ebay.com.my',
+        'ebay.ph', 'ebay.in', 'ebay.us', 'ebay.cn', 'ebay.co.jp',
+    )
+    EBAY_SHORT_HOSTS = ('ebay.to', 'ebay.us')
+
     def validate_ebay_url(self, url: str) -> bool:
         """
-        Validate if the URL is a valid eBay product URL.
-        
-        Args:
-            url: URL to validate
-            
-        Returns:
-            True if URL is valid eBay product URL
-            
-        Raises:
-            ValidationError: If URL format is invalid
+        Validate that the URL is from an eBay domain or recognised short link host.
+
+        Accepts a wide range of formats:
+        - /itm/<id>, /itm/<slug>/<id>, /itm/<id>?...
+        - /p/<product-id>
+        - URLs with query params (?_trkparms=, &hash=, etc.)
+        - Regional eBay domains (.com, .co.uk, .de, .fr, .it, .com.au, ...)
+        - Short URLs (ebay.to, ebay.us redirects)
+        - URLs with trailing slashes, fragments, mixed case
+
+        Raises ValidationError with a clear, user-actionable message on failure.
+        """
+        if not url or not isinstance(url, str):
+            raise ValidationError("URL must be a non-empty string")
+
+        url = url.strip()
+        if not url:
+            raise ValidationError("URL is empty")
+
+        # Auto-prepend scheme if missing (common user mistake)
+        if not re.match(r'^[a-zA-Z]+://', url):
+            url = 'https://' + url
+
+        try:
+            parsed = urlparse(url)
+        except Exception as e:
+            raise ValidationError(f"Could not parse URL: {e}")
+
+        netloc = parsed.netloc.lower().split(':')[0]
+        # Strip leading www. and m. (mobile) prefixes
+        for prefix in ('www.', 'm.', 'pages.'):
+            if netloc.startswith(prefix):
+                netloc = netloc[len(prefix):]
+                break
+
+        if not netloc:
+            raise ValidationError("URL is missing a domain")
+
+        # Accept any *.ebay.<tld> and known short hosts
+        is_ebay_host = (
+            netloc in self.EBAY_DOMAINS
+            or netloc in self.EBAY_SHORT_HOSTS
+            or netloc.startswith('ebay.')
+            or '.ebay.' in netloc
+        )
+        if not is_ebay_host:
+            raise ValidationError(
+                "URL must be from an eBay domain (e.g. ebay.com, ebay.co.uk, ebay.de, ebay.to)"
+            )
+
+        # Short URLs will be resolved on fetch — accept them here
+        if netloc in self.EBAY_SHORT_HOSTS:
+            return True
+
+        path = parsed.path or ''
+        query = parsed.query or ''
+
+        # Accept any of: /itm/, /p/, ?item=, ?itm=, or a path containing a long numeric id
+        if (
+            '/itm/' in path
+            or '/p/' in path
+            or re.search(r'[?&](item|itm)=\d{6,}', query)
+            or re.search(r'/\d{10,}(?:[/?#]|$)', path)
+        ):
+            return True
+
+        raise ValidationError(
+            "URL does not look like an eBay item or product page. "
+            "Expected formats: /itm/<id>, /p/<product-id>, or a short ebay.to link."
+        )
+
+    def normalize_ebay_url(self, url: str) -> str:
+        """
+        Return a canonical eBay item URL when possible, otherwise the original.
+        Trims tracking params and resolves to a clean /itm/<id> form on .com.
         """
         try:
-            if not url or not isinstance(url, str):
-                raise ValidationError("URL must be a non-empty string")
-            
-            parsed = urlparse(url.strip())
-            netloc = parsed.netloc.lower()
-            
-            # Check for eBay domain (supports regional domains)
-            if 'ebay.' not in netloc:
-                raise ValidationError("URL must be from an eBay domain")
-            
-            # Check for item URL pattern
-            if '/itm/' not in url:
-                raise ValidationError("URL must be an eBay item URL (contains /itm/)")
-            
-            return True
-            
-        except ValidationError:
-            raise
-        except Exception as e:
-            raise ValidationError(f"Invalid URL format: {e}")
+            item_id = self.extract_id_from_url(url)
+            if item_id and item_id.isdigit() and len(item_id) >= 9:
+                # Preserve the user's regional TLD if present
+                parsed = urlparse(url if re.match(r'^[a-zA-Z]+://', url) else 'https://' + url)
+                netloc = parsed.netloc.lower() or 'www.ebay.com'
+                if not netloc.startswith('www.') and not netloc.startswith('m.'):
+                    netloc = 'www.' + netloc
+                return f"https://{netloc}/itm/{item_id}"
+        except Exception:
+            pass
+        return url
     
     def _get_clean_text(self, element: Tag) -> str:
         """
@@ -658,20 +866,42 @@ class EbayScraper:
             raise DataExtractionError(f"Failed to extract product data: {e}")
 
     def extract_id_from_url(self, url: str) -> Optional[str]:
-        """Extract eBay Item ID from URL."""
+        """Extract eBay Item ID from a wide variety of URL formats."""
+        if not url:
+            return None
         try:
-            parsed = urlparse(url)
-            # Standard /itm/ID format
+            parsed = urlparse(url if re.match(r'^[a-zA-Z]+://', url) else 'https://' + url)
+
+            # Standard /itm/<id> or /itm/<slug>/<id>
             if '/itm/' in parsed.path:
-                parts = parsed.path.split('/')
-                for p in reversed(parts):
-                    if p.isdigit():
-                        return p
-            
-            # Query parameter format
-            query = parse_qs(parsed.query)
-            if 'itm' in query:
-                return query['itm'][0]
+                for p in reversed(parsed.path.split('/')):
+                    digits = re.sub(r'\D', '', p)
+                    if digits.isdigit() and len(digits) >= 9:
+                        return digits
+
+            # /p/<product-id> (product-page form, may not be a listing id but still useful)
+            if '/p/' in parsed.path:
+                for p in reversed(parsed.path.split('/')):
+                    digits = re.sub(r'\D', '', p)
+                    if digits.isdigit() and len(digits) >= 6:
+                        return digits
+
+            # Query-param forms: ?item=, ?itm=, ?hash=item123:...
+            query = parse_qs(parsed.query or '')
+            for key in ('item', 'itm', 'iid'):
+                if key in query and query[key]:
+                    digits = re.sub(r'\D', '', query[key][0])
+                    if digits.isdigit() and len(digits) >= 9:
+                        return digits
+            hash_val = query.get('hash', [''])[0]
+            m = re.search(r'item(\d{9,})', hash_val)
+            if m:
+                return m.group(1)
+
+            # Fallback: any 10+ digit number anywhere in path
+            m = re.search(r'(\d{10,})', parsed.path)
+            if m:
+                return m.group(1)
         except Exception:
             pass
         return None
@@ -1136,13 +1366,16 @@ class EbayScraper:
         Returns ScrapingResult with success/failure and detailed error messages.
         """
         try:
-            # Validate URL
+            # Validate URL (raises ValidationError on bad input)
             self.validate_ebay_url(url)
-            
+
+            # Normalize to a canonical form when we can extract an item id
+            url = self.normalize_ebay_url(url.strip())
+
             # Add anti-detection delay
             time.sleep(random.uniform(0.5, 2.0))
-            
-            # Fetch page
+
+            # Fetch page (requests follows redirects by default, handling ebay.to/ebay.us)
             response = safe_request(self.session, url, timeout=30)
             if not response:
                 return ScrapingResult(
@@ -2747,785 +2980,494 @@ def show_processing_stage(stage: str, icon: str = "⚙️"):
     )
 
 def inject_global_styles() -> None:
-    """Inject modern, animated global styles with Streamlit's latest design patterns."""
+    """Inject modern, premium global styles with sidebar-nav-friendly layout."""
     st.markdown(
         """
         <style>
-        /* Import modern fonts */
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-        
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap');
+
         :root {
-          /* Modern color palette - Black and white with strong contrast */
-          --bg-primary: #ffffff;
-          --bg-secondary: #f9fafb;
-          --bg-tertiary: #f3f4f6;
-          --surface: linear-gradient(135deg, #ffffff 0%, #f9fafb 100%);
-          --surface-hover: #e5e7eb;
-          --text-primary: #000000;
-          --text-secondary: #374151;
-          --text-muted: #6b7280;
-          --accent-primary: #000000;
-          --accent-secondary: #1f2937;
-          --accent-glow: rgba(0, 0, 0, 0.1);
-          --success: #10b981;
-          --success-glow: rgba(16, 185, 129, 0.15);
-          --warning: #f59e0b;
-          --error: #ef4444;
-          --border: rgba(0, 0, 0, 0.1);
-          --border-strong: rgba(0, 0, 0, 0.2);
-          --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.12);
-          --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.15);
-          --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.18);
-          --glow-black: 0 0 20px rgba(0, 0, 0, 0.2);
-          --glow-green: 0 0 20px rgba(16, 185, 129, 0.2);
-        }
-        
-        html, body, .stApp {
-          font-family: 'Inter', sans-serif !important;
-          background: var(--bg-primary) !important;
-          color: var(--text-primary) !important;
-          scroll-behavior: smooth !important;
+            --bg: #f7f7f8;
+            --surface: #ffffff;
+            --surface-2: #fafafa;
+            --surface-3: #f3f4f6;
+            --border: #e5e7eb;
+            --border-strong: #d1d5db;
+            --text: #0f172a;
+            --text-soft: #475569;
+            --text-muted: #94a3b8;
+            --brand: #0f172a;
+            --brand-hover: #1e293b;
+            --accent: #6366f1;
+            --accent-2: #8b5cf6;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --info: #3b82f6;
+            --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04), 0 1px 3px rgba(15, 23, 42, 0.06);
+            --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.06), 0 2px 4px rgba(15, 23, 42, 0.04);
+            --shadow-lg: 0 20px 40px -16px rgba(15, 23, 42, 0.18), 0 8px 16px -8px rgba(15, 23, 42, 0.08);
+            --radius-sm: 8px;
+            --radius-md: 12px;
+            --radius-lg: 16px;
+            --radius-xl: 20px;
+            --radius-pill: 999px;
         }
 
-        /* Enforce font on text elements only, avoiding icons */
-        h1, h2, h3, h4, h5, h6, p, label, input, button, textarea, select, .stMarkdown, .stText {
-             font-family: 'Inter', sans-serif !important;
+        html, body, .stApp, [class*="st-emotion"] {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
+            font-feature-settings: "ss01", "cv11";
         }
-        
-        /* Exception for icons if possible - Streamlit icons often use specific font families 
-           that might be overwritten by 'span' or 'div' above. 
-           We can try to exclude common icon classes or just accept that 'div'/'span' is still risky.
-           Better approach: Apply font to local context or .stApp but NOT !important on generic tags if avoidable.
-           However, to force the look, we need some force. Start with the above, if glitch persists, 
-           we narrow down. The previous [class*="css"] was definitely too broad.
-        */
-        
-        /* Input & Button Styling */
-        .stTextInput input {
-            border: 2px solid #e5e7eb !important;
-            border-radius: 10px !important;
-            padding: 12px 16px !important;
-            font-size: 1.1rem !important;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.02) !important;
-            transition: all 0.2s ease !important;
-        }
-        .stTextInput input:focus {
-            border-color: #000000 !important;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.05) !important;
-        }
-        div[data-testid="stButton"] button {
-            border-radius: 10px !important;
-            font-weight: 600 !important;
-            padding: 0.75rem 1.5rem !important;
-            transition: transform 0.1s ease !important;
-        }
-        div[data-testid="stButton"] button:active {
-            transform: scale(0.98) !important;
+        .stApp { background: var(--bg) !important; color: var(--text) !important; }
+
+        /* Hide Streamlit chrome */
+        #MainMenu, footer, header[data-testid="stHeader"] { visibility: hidden !important; height: 0 !important; }
+
+        /* ---------- LAYOUT ---------- */
+        .block-container {
+            padding: 1.75rem 2rem 4rem !important;
+            max-width: 1400px !important;
         }
 
-        /* Product Card Styling */
-        .product-card {
-            background: #ffffff;
-            border-radius: 16px;
-            box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.08);
-            border: 1px solid rgba(0,0,0,0.04);
+        /* ---------- TYPOGRAPHY ---------- */
+        h1 { font-size: 2rem !important; font-weight: 800 !important; letter-spacing: -0.03em !important; color: var(--text) !important; margin: 0 0 0.25rem !important; }
+        h2 { font-size: 1.4rem !important; font-weight: 700 !important; letter-spacing: -0.02em !important; color: var(--text) !important; margin: 0 0 0.5rem !important; }
+        h3 { font-size: 1.1rem !important; font-weight: 700 !important; color: var(--text) !important; margin: 0 0 0.5rem !important; }
+        h4 { font-size: 0.98rem !important; font-weight: 600 !important; color: var(--text) !important; }
+        p, label, span, div { color: var(--text); }
+
+        /* ---------- PAGE HEADER (custom hero block) ---------- */
+        .es-hero {
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #312e81 100%);
+            color: white;
+            border-radius: var(--radius-lg);
+            padding: 1.75rem 2rem;
+            margin-bottom: 1.5rem;
+            box-shadow: var(--shadow-lg);
+            position: relative;
             overflow: hidden;
-            margin-top: 1rem;
-            animation: fadeInUp 0.5s ease-out;
         }
-        .product-header {
-            padding: 1.5rem 2rem;
-            background: linear-gradient(to right, #f8f9fa, #ffffff);
-            border-bottom: 1px solid rgba(0,0,0,0.05);
+        .es-hero::before {
+            content: "";
+            position: absolute;
+            top: -50%; right: -10%;
+            width: 60%; height: 200%;
+            background: radial-gradient(circle, rgba(139, 92, 246, 0.4) 0%, transparent 60%);
+            transform: rotate(15deg);
+            pointer-events: none;
         }
-        .product-title {
-            font-size: 1.4rem;
+        .es-hero h1 { color: white !important; font-size: 1.85rem !important; font-weight: 800 !important; margin: 0 !important; letter-spacing: -0.02em !important; }
+        .es-hero p { color: rgba(255, 255, 255, 0.7) !important; margin: 0.25rem 0 0 !important; font-size: 0.95rem !important; }
+        .es-hero .es-badge {
+            display: inline-block;
+            background: rgba(139, 92, 246, 0.2);
+            color: #c4b5fd;
+            border: 1px solid rgba(139, 92, 246, 0.4);
+            padding: 0.2rem 0.7rem;
+            border-radius: var(--radius-pill);
+            font-size: 0.72rem;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            margin-bottom: 0.6rem;
+        }
+
+        /* ---------- SECTION CARDS ---------- */
+        .es-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            padding: 1.5rem;
+            box-shadow: var(--shadow-sm);
+            margin-bottom: 1.25rem;
+        }
+        .es-card-title {
+            font-size: 1rem;
             font-weight: 700;
-            color: #111827;
-            line-height: 1.4;
-            margin: 0;
-        }
-        .product-body {
+            color: var(--text);
             display: flex;
-            padding: 2rem;
-            gap: 2.5rem;
-            flex-wrap: wrap;
-        }
-        .product-image-container {
-            flex: 0 0 350px;
-            max-width: 100%;
-        }
-        .product-image {
-            width: 100%;
-            border-radius: 12px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.08);
-            object-fit: contain;
-            background: #f3f4f6;
-            aspect-ratio: 1;
-        }
-        .product-details {
-            flex: 1;
-            min-width: 300px;
-        }
-        .price-tag {
-            font-size: 2.5rem;
-            font-weight: 800;
-            color: #000000;
+            align-items: center;
+            gap: 0.5rem;
             margin-bottom: 0.25rem;
         }
-        .detail-row {
-            display: flex;
-            align-items: flex-start;
-            padding: 0.75rem 0;
-            border-bottom: 1px solid #f3f4f6;
+        .es-card-sub {
+            color: var(--text-soft);
+            font-size: 0.88rem;
+            margin: 0 0 1rem;
         }
-        .detail-label {
-            font-weight: 600;
-            color: #6b7280;
-            width: 100px;
-            flex-shrink: 0;
-            font-size: 0.95rem;
-        }
-        .detail-value {
-            color: #1f2937;
-            font-size: 0.95rem;
-            line-height: 1.5;
-        }
-        .status-section {
-            display: flex;
-            gap: 1rem;
-            flex-wrap: wrap;
-            margin-top: 1.5rem;
-            padding-top: 1.5rem;
-            border-top: 2px dashed #f3f4f6;
-        }
-        .status-badge {
-            display: inline-flex;
-            align-items: center;
-            padding: 0.35rem 0.85rem;
-            border-radius: 9999px;
-            font-size: 0.85rem;
-            font-weight: 600;
-            background: #f0fdf4;
-            color: #15803d;
-            border: 1px solid rgba(22, 163, 74, 0.2);
-        }
-        .status-badge.neutral {
-            background: #f3f4f6;
-            color: #4b5563;
-            border-color: #e5e7eb;
-        }
-        .action-buttons {
-            display: flex;
-            gap: 1rem;
-            margin-top: 1.5rem;
-        }
-        
-        /* Global app styles */
-        .stApp {
-          background: var(--bg-primary) !important;
-        }
-        
-        .block-container {
-          padding: 2.5rem 2rem !important;
-          max-width: 1600px !important;
-          animation: fadeInUp 0.5s ease-out !important;
-        }
-        
-        /* Enhanced Typography */
-        h1, h2, h3, h4, h5, h6 {
-          font-weight: 700 !important;
-          letter-spacing: -0.02em !important;
-          color: var(--text-primary) !important;
-          line-height: 1.3 !important;
-        }
-        
-        h1 {
-          font-size: 2.5rem !important;
-          color: #000000 !important;
-          margin-bottom: 0.5rem !important;
-        }
-        
-        h2 {
-          font-size: 1.75rem !important;
-          margin-bottom: 1rem !important;
-          color: #000000 !important;
-        }
-        
-        h3 {
-          font-size: 1.25rem !important;
-          margin-bottom: 0.875rem !important;
-          color: #374151 !important;
-        }
-        
-        p, div, span, label {
-          font-size: 0.95rem !important;
-        }
-        
-        /* Input labels */
-        .stTextInput label, .stNumberInput label, .stSelectbox label, .stTextArea label {
-          font-size: 0.9rem !important;
-          font-weight: 600 !important;
-          color: #000000 !important;
-          margin-bottom: 0.5rem !important;
-        }
-        
-        /* Modern Tabs with black active state */
-        .stTabs [data-baseweb="tab-list"] {
-          gap: 10px !important;
-          border-bottom: 2px solid var(--border-strong) !important;
-          background: transparent !important;
-          padding-bottom: 0 !important;
-        }
-        
-        .stTabs [data-baseweb="tab"] {
-          background: var(--bg-tertiary) !important;
-          color: var(--text-muted) !important;
-          border-radius: 8px 8px 0 0 !important;
-          padding: 14px 24px !important;
-          border: 2px solid var(--border) !important;
-          border-bottom: none !important;
-          font-weight: 600 !important;
-          font-size: 0.95rem !important;
-          transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
-          position: relative !important;
-        }
-        
-        .stTabs [data-baseweb="tab"]::before {
-          content: '' !important;
-          position: absolute !important;
-          bottom: -2px !important;
-          left: 0 !important;
-          right: 0 !important;
-          height: 2px !important;
-          background: transparent !important;
-          transition: all 0.3s ease !important;
-        }
-        
-        .stTabs [data-baseweb="tab"]:hover {
-          background: var(--surface-hover) !important;
-          color: var(--text-secondary) !important;
-          transform: translateY(-2px) !important;
-        }
-        
-        .stTabs [aria-selected="true"] {
-          background: #000000 !important;
-          color: white !important;
-          border-color: #000000 !important;
-          box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2) !important;
-          transform: translateY(-2px) !important;
-        }
-        
-        .stTabs [aria-selected="true"]::before {
-          background: white !important;
-        }
-        
-        /* Enhanced Input fields with better visibility */
-        .stTextInput input,
-        .stNumberInput input {
-          background: #ffffff !important;
-          color: #000000 !important;
-          border-radius: 8px !important;
-          border: 2px solid #d1d5db !important;
-          padding: 12px 16px !important;
-          font-size: 1rem !important;
-          font-weight: 500 !important;
-          transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
-        }
-        
-        .stTextInput input:focus,
-        .stNumberInput input:focus {
-          border-color: #000000 !important;
-          box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.1) !important;
-          background: #ffffff !important;
-          outline: none !important;
-        }
-        
-        .stTextInput input:hover,
-        .stNumberInput input:hover {
-          border-color: #9ca3af !important;
-        }
-        
-        .stTextInput input::placeholder,
-        .stNumberInput input::placeholder {
-          color: #9ca3af !important;
-          font-weight: 400 !important;
-        }
-        
-        /* Select boxes with better visibility */
-        .stSelectbox [data-baseweb="select"] > div {
-          background: #ffffff !important;
-          color: #000000 !important;
-          border-radius: 8px !important;
-          border: 2px solid #d1d5db !important;
-          font-size: 1rem !important;
-          font-weight: 500 !important;
-          transition: all 0.3s ease !important;
-          min-height: 48px !important;
-        }
-        
-        .stSelectbox [data-baseweb="select"]:hover > div {
-          border-color: #9ca3af !important;
-        }
-        
-        .stSelectbox [data-baseweb="select"]:focus-within > div {
-          border-color: #000000 !important;
-          box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.1) !important;
-        }
-        
-        /* Dropdown menu */
-        [data-baseweb="menu"] {
-          background: #ffffff !important;
-          border: 2px solid #d1d5db !important;
-          border-radius: 8px !important;
-          box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15) !important;
-        }
-        
-        [data-baseweb="menu"] li {
-          color: #000000 !important;
-          font-size: 0.95rem !important;
-          font-weight: 500 !important;
-          padding: 10px 16px !important;
-        }
-        
-        [data-baseweb="menu"] li:hover {
-          background: #f3f4f6 !important;
-        }
-        
-        /* Text areas with better visibility */
-        .stTextArea textarea {
-          background: #ffffff !important;
-          color: #000000 !important;
-          border-radius: 8px !important;
-          border: 2px solid #d1d5db !important;
-          font-size: 1rem !important;
-          font-weight: 500 !important;
-          padding: 12px 16px !important;
-          transition: all 0.3s ease !important;
-        }
-        
-        .stTextArea textarea:focus {
-          border-color: #000000 !important;
-          box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.1) !important;
-          outline: none !important;
-        }
-        
-        .stTextArea textarea::placeholder {
-          color: #9ca3af !important;
-          font-weight: 400 !important;
-        }
-        
-        /* Modern Buttons with solid black */
-        .stButton > button {
-          background: #000000 !important;
-          color: white !important;
-          border-radius: 8px !important;
-          padding: 12px 28px !important;
-          border: 2px solid #000000 !important;
-          font-weight: 600 !important;
-          font-size: 0.95rem !important;
-          transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
-          box-shadow: var(--shadow-sm) !important;
-          position: relative !important;
-          overflow: hidden !important;
-        }
-        
-        .stButton > button::before {
-          content: '' !important;
-          position: absolute !important;
-          top: 50% !important;
-          left: 50% !important;
-          width: 0 !important;
-          height: 0 !important;
-          border-radius: 50% !important;
-          background: rgba(255, 255, 255, 0.2) !important;
-          transform: translate(-50%, -50%) !important;
-          transition: width 0.6s, height 0.6s !important;
-        }
-        
-        .stButton > button:hover::before {
-          width: 300px !important;
-          height: 300px !important;
-        }
-        
-        .stButton > button:hover {
-          transform: translateY(-2px) !important;
-          box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25) !important;
-          background: #1f2937 !important;
-        }
-        
-        .stButton > button:active {
-          transform: translateY(0) !important;
-        }
-        
-        /* Download button with green */
-        .stDownloadButton > button {
-          background: #10b981 !important;
-          border-color: #10b981 !important;
-        }
-        
-        .stDownloadButton > button:hover {
-          background: #059669 !important;
-          box-shadow: var(--glow-green), var(--shadow-md) !important;
-        }
-        
-        /* Enhanced Cards with gradient borders */
-        .card {
-          background: var(--surface) !important;
-          border: 1.5px solid var(--border) !important;
-          border-radius: 16px !important;
-          padding: 2rem !important;
-          margin-bottom: 2rem !important;
-          box-shadow: var(--shadow-md) !important;
-          position: relative !important;
-          overflow: hidden !important;
-          animation: fadeInScale 0.4s ease-out !important;
-        }
-        
-        .card::before {
-          content: '' !important;
-          position: absolute !important;
-          top: 0 !important;
-          left: 0 !important;
-          right: 0 !important;
-          height: 3px !important;
-          background: linear-gradient(90deg, var(--accent-primary), var(--success), var(--accent-primary)) !important;
-          background-size: 200% 100% !important;
-          animation: gradientShift 3s ease infinite !important;
-        }
-        
-        .card h2, .card h3 {
-          margin-top: 0 !important;
-        }
-        
-        .card p.muted {
-          color: var(--text-muted) !important;
-          font-size: 0.95rem !important;
-          margin-bottom: 1rem !important;
-        }
-        
-        /* Status messages with animation */
-        .stAlert {
-          border-radius: 8px !important;
-          border-left-width: 4px !important;
-          padding: 1rem 1.25rem !important;
-          animation: slideInLeft 0.3s ease-out !important;
-        }
-        
-        .stSuccess {
-          background: #f0fdf4 !important;
-          border-left-color: #10b981 !important;
-          color: #000000 !important;
-        }
-        
-        .stWarning {
-          background: #fffbeb !important;
-          border-left-color: #f59e0b !important;
-          color: #000000 !important;
-        }
-        
-        .stError {
-          background: #fef2f2 !important;
-          border-left-color: #ef4444 !important;
-          color: #000000 !important;
-        }
-        
-        .stInfo {
-          background: #eff6ff !important;
-          border-left-color: #000000 !important;
-          color: #000000 !important;
-        }
-        
-        /* Animated Progress bar */
-        .stProgress > div > div > div {
-          background: linear-gradient(90deg, #000000, #10b981) !important;
-          background-size: 200% 100% !important;
-          animation: gradientShift 2s ease infinite !important;
-          border-radius: 8px !important;
-          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2) !important;
-        }
-        
-        /* Enhanced Expander */
-        .streamlit-expanderHeader {
-          background: #f9fafb !important;
-          border-radius: 8px !important;
-          border: 2px solid #d1d5db !important;
-          color: #000000 !important;
-          font-weight: 600 !important;
-          font-size: 1rem !important;
-          padding: 1rem !important;
-          transition: all 0.3s ease !important;
-        }
-        
-        .streamlit-expanderHeader:hover {
-          border-color: #000000 !important;
-          background: #e5e7eb !important;
-        }
-        
-        .streamlit-expanderContent {
-          background: #ffffff !important;
-          border: 2px solid #d1d5db !important;
-          border-top: none !important;
-          border-radius: 0 0 8px 8px !important;
-          padding: 1rem !important;
-        }
-        
-        /* Sidebar styling */
+
+        /* ---------- SIDEBAR ---------- */
         section[data-testid="stSidebar"] {
-          background: #f9fafb !important;
-          border-right: 2px solid #d1d5db !important;
+            background: linear-gradient(180deg, #ffffff 0%, #fafafa 100%) !important;
+            border-right: 1px solid var(--border) !important;
+            box-shadow: 4px 0 24px rgba(15, 23, 42, 0.04);
         }
-        
-        section[data-testid="stSidebar"] > div {
-          padding-top: 2rem !important;
-        }
-        
+        section[data-testid="stSidebar"] > div { padding: 1.25rem 0.85rem !important; }
         section[data-testid="stSidebar"] h2,
-        section[data-testid="stSidebar"] h3 {
-          color: #000000 !important;
-          font-weight: 700 !important;
+        section[data-testid="stSidebar"] h3 { color: var(--text) !important; }
+        section[data-testid="stSidebar"] .es-side-brand {
+            display: flex; align-items: center; gap: 0.6rem;
+            padding: 0.4rem 0.5rem 1rem;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 1rem;
         }
-        
-        section[data-testid="stSidebar"] label {
-          color: #000000 !important;
-          font-weight: 600 !important;
-          font-size: 0.9rem !important;
+        section[data-testid="stSidebar"] .es-side-brand .es-logo {
+            width: 36px; height: 36px;
+            border-radius: 10px;
+            background: linear-gradient(135deg, #0f172a, #6366f1);
+            display: flex; align-items: center; justify-content: center;
+            color: white; font-weight: 800; font-size: 1rem;
+            box-shadow: var(--shadow-md);
         }
-        
-        /* Spinner with pulse */
-        .stSpinner > div {
-          border-top-color: #000000 !important;
-          animation: spin 1s linear infinite, pulse 2s ease-in-out infinite !important;
+        section[data-testid="stSidebar"] .es-side-brand .es-side-title {
+            font-weight: 800; color: var(--text); font-size: 1.05rem; line-height: 1;
         }
-        
-        /* Metrics with emphasis */
-        [data-testid="stMetricValue"] {
-          color: #000000 !important;
-          font-size: 2.2rem !important;
-          font-weight: 700 !important;
+        section[data-testid="stSidebar"] .es-side-brand .es-side-sub {
+            color: var(--text-muted); font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase;
         }
-        
-        [data-testid="stMetricLabel"] {
-          color: #6b7280 !important;
-          font-size: 0.9rem !important;
-          font-weight: 600 !important;
+        section[data-testid="stSidebar"] .es-side-section {
+            color: var(--text-muted) !important;
+            font-size: 0.68rem !important;
+            font-weight: 700 !important;
+            letter-spacing: 0.12em !important;
+            text-transform: uppercase !important;
+            padding: 0.5rem 0.75rem;
+            margin-top: 0.5rem;
         }
-        
-        /* Code blocks */
-        .stCodeBlock {
-          background: #f9fafb !important;
-          border: 2px solid #d1d5db !important;
-          border-radius: 8px !important;
-          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12) !important;
+
+        /* Sidebar radio nav -> styled pills/cards */
+        section[data-testid="stSidebar"] div[role="radiogroup"] {
+            gap: 0.25rem !important;
+            background: transparent !important;
         }
-        
-        code {
-          background: #f3f4f6 !important;
-          color: #000000 !important;
-          padding: 2px 6px !important;
-          border-radius: 4px !important;
-          font-size: 0.9rem !important;
-          font-weight: 500 !important;
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label {
+            background: transparent !important;
+            border: 1px solid transparent !important;
+            border-radius: var(--radius-md) !important;
+            padding: 0.6rem 0.85rem !important;
+            cursor: pointer !important;
+            transition: all 0.18s ease !important;
+            display: flex !important;
+            align-items: center !important;
+            gap: 0.55rem !important;
+            margin: 0 !important;
+            color: var(--text-soft) !important;
+            font-weight: 500 !important;
         }
-        
-        /* Multiselect tags - modern black style */
-        .stMultiSelect [data-baseweb="tag"] {
-          background: #000000 !important;
-          color: white !important;
-          border-radius: 6px !important;
-          padding: 6px 12px !important;
-          font-weight: 600 !important;
-          font-size: 0.9rem !important;
-          margin: 2px !important;
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label:hover {
+            background: var(--surface-3) !important;
+            color: var(--text) !important;
         }
-        
-        .stMultiSelect [data-baseweb="tag"] svg {
-          fill: white !important;
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label[data-baseweb="radio"] > div:first-child {
+            display: none !important;
         }
-        
-        .stMultiSelect [data-baseweb="tag"]:hover {
-          background: #1f2937 !important;
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label[aria-checked="true"] {
+            background: var(--brand) !important;
+            color: white !important;
+            border-color: var(--brand) !important;
+            box-shadow: var(--shadow-md) !important;
+            transform: translateX(2px);
         }
-        
-        .stMultiSelect label {
-          color: #000000 !important;
-          font-weight: 600 !important;
-          font-size: 0.9rem !important;
-          margin-bottom: 0.5rem !important;
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label[aria-checked="true"] * {
+            color: white !important;
         }
-        
+
+        /* ---------- TABS (used in sub-tabs) ---------- */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 0.4rem !important;
+            background: var(--surface-3) !important;
+            padding: 0.3rem !important;
+            border-radius: var(--radius-pill) !important;
+            border: 1px solid var(--border) !important;
+            display: inline-flex !important;
+            width: auto !important;
+        }
+        .stTabs [data-baseweb="tab"] {
+            background: transparent !important;
+            color: var(--text-soft) !important;
+            border-radius: var(--radius-pill) !important;
+            padding: 0.5rem 1.1rem !important;
+            border: none !important;
+            font-weight: 600 !important;
+            font-size: 0.88rem !important;
+            transition: all 0.18s ease !important;
+            min-height: unset !important;
+        }
+        .stTabs [data-baseweb="tab"]:hover { background: rgba(15, 23, 42, 0.04) !important; color: var(--text) !important; transform: none !important; }
+        .stTabs [aria-selected="true"] {
+            background: var(--surface) !important;
+            color: var(--text) !important;
+            box-shadow: var(--shadow-sm) !important;
+            transform: none !important;
+        }
+        .stTabs [data-baseweb="tab-highlight"] { display: none !important; }
+        .stTabs [data-baseweb="tab-border"] { display: none !important; }
+
+        /* ---------- INPUTS ---------- */
+        .stTextInput input, .stNumberInput input, .stTextArea textarea, .stDateInput input {
+            background: var(--surface) !important;
+            color: var(--text) !important;
+            border: 1.5px solid var(--border) !important;
+            border-radius: var(--radius-md) !important;
+            padding: 0.65rem 0.9rem !important;
+            font-size: 0.95rem !important;
+            font-weight: 500 !important;
+            transition: all 0.18s ease !important;
+            box-shadow: var(--shadow-sm) !important;
+        }
+        .stTextInput input::placeholder, .stTextArea textarea::placeholder {
+            color: var(--text-muted) !important;
+            font-weight: 400 !important;
+        }
+        .stTextInput input:focus, .stNumberInput input:focus, .stTextArea textarea:focus {
+            border-color: var(--accent) !important;
+            box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.12) !important;
+            outline: none !important;
+        }
+        .stTextInput input:hover, .stNumberInput input:hover, .stTextArea textarea:hover {
+            border-color: var(--border-strong) !important;
+        }
+
+        /* Selects */
+        .stSelectbox [data-baseweb="select"] > div,
         .stMultiSelect [data-baseweb="select"] {
-          background: #ffffff !important;
-          border: 2px solid #d1d5db !important;
-          border-radius: 8px !important;
+            background: var(--surface) !important;
+            border: 1.5px solid var(--border) !important;
+            border-radius: var(--radius-md) !important;
+            min-height: 44px !important;
+            box-shadow: var(--shadow-sm) !important;
+            transition: all 0.18s ease !important;
         }
-        
-        .stMultiSelect [data-baseweb="select"]:hover {
-          border-color: #9ca3af !important;
-        }
-        
+        .stSelectbox [data-baseweb="select"]:focus-within > div,
         .stMultiSelect [data-baseweb="select"]:focus-within {
-          border-color: #000000 !important;
-          box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.1) !important;
+            border-color: var(--accent) !important;
+            box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.12) !important;
         }
-        
-        /* Checkbox and Radio */
-        .stCheckbox, .stRadio {
-          color: #000000 !important;
-          font-weight: 500 !important;
+        [data-baseweb="menu"] {
+            background: var(--surface) !important;
+            border: 1px solid var(--border) !important;
+            border-radius: var(--radius-md) !important;
+            box-shadow: var(--shadow-lg) !important;
         }
-        
-        /* Slider styling */
+        [data-baseweb="menu"] li:hover { background: var(--surface-3) !important; }
+
+        /* Multiselect tags */
+        .stMultiSelect [data-baseweb="tag"] {
+            background: var(--brand) !important;
+            color: white !important;
+            border-radius: var(--radius-sm) !important;
+            font-weight: 600 !important;
+        }
+        .stMultiSelect [data-baseweb="tag"] svg { fill: white !important; }
+
+        /* ---------- BUTTONS ---------- */
+        .stButton > button {
+            background: var(--brand) !important;
+            color: white !important;
+            border: 1.5px solid var(--brand) !important;
+            border-radius: var(--radius-md) !important;
+            padding: 0.6rem 1.25rem !important;
+            font-weight: 600 !important;
+            font-size: 0.92rem !important;
+            transition: all 0.18s ease !important;
+            box-shadow: var(--shadow-sm) !important;
+            letter-spacing: -0.005em !important;
+        }
+        .stButton > button:hover {
+            background: var(--brand-hover) !important;
+            border-color: var(--brand-hover) !important;
+            transform: translateY(-1px) !important;
+            box-shadow: var(--shadow-md) !important;
+        }
+        .stButton > button:active { transform: translateY(0) !important; }
+        .stButton > button[kind="secondary"] {
+            background: var(--surface) !important;
+            color: var(--text) !important;
+            border: 1.5px solid var(--border) !important;
+            box-shadow: var(--shadow-sm) !important;
+        }
+        .stButton > button[kind="secondary"]:hover {
+            background: var(--surface-3) !important;
+            border-color: var(--border-strong) !important;
+        }
+        .stButton > button[kind="primary"] {
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%) !important;
+            border-color: transparent !important;
+            box-shadow: 0 4px 14px rgba(99, 102, 241, 0.35) !important;
+        }
+        .stButton > button[kind="primary"]:hover {
+            box-shadow: 0 6px 20px rgba(99, 102, 241, 0.45) !important;
+            filter: brightness(1.05);
+        }
+        .stDownloadButton > button {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%) !important;
+            border-color: transparent !important;
+            color: white !important;
+            box-shadow: 0 4px 14px rgba(16, 185, 129, 0.3) !important;
+        }
+        .stDownloadButton > button:hover {
+            box-shadow: 0 6px 20px rgba(16, 185, 129, 0.4) !important;
+        }
+
+        /* ---------- ALERTS ---------- */
+        .stAlert {
+            border-radius: var(--radius-md) !important;
+            border: 1px solid var(--border) !important;
+            border-left-width: 4px !important;
+            padding: 0.85rem 1rem !important;
+            box-shadow: var(--shadow-sm) !important;
+        }
+        .stSuccess { background: #f0fdf4 !important; border-left-color: var(--success) !important; }
+        .stInfo { background: #eff6ff !important; border-left-color: var(--info) !important; }
+        .stWarning { background: #fffbeb !important; border-left-color: var(--warning) !important; }
+        .stError { background: #fef2f2 !important; border-left-color: var(--danger) !important; }
+
+        /* ---------- PROGRESS ---------- */
+        .stProgress > div > div > div {
+            background: linear-gradient(90deg, var(--accent), var(--accent-2)) !important;
+            border-radius: var(--radius-pill) !important;
+        }
+        .stProgress > div > div {
+            background: var(--surface-3) !important;
+            border-radius: var(--radius-pill) !important;
+        }
+
+        /* ---------- EXPANDER ---------- */
+        details[data-testid="stExpander"], .streamlit-expanderHeader {
+            background: var(--surface) !important;
+            border: 1px solid var(--border) !important;
+            border-radius: var(--radius-md) !important;
+            box-shadow: var(--shadow-sm) !important;
+        }
+        details[data-testid="stExpander"] summary {
+            padding: 0.85rem 1rem !important;
+            font-weight: 600 !important;
+            color: var(--text) !important;
+        }
+        details[data-testid="stExpander"] summary:hover { background: var(--surface-3) !important; }
+
+        /* ---------- METRICS ---------- */
+        [data-testid="stMetric"] {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 1rem 1.25rem;
+            box-shadow: var(--shadow-sm);
+        }
+        [data-testid="stMetricValue"] {
+            color: var(--text) !important;
+            font-size: 1.75rem !important;
+            font-weight: 800 !important;
+            letter-spacing: -0.02em !important;
+        }
+        [data-testid="stMetricLabel"] {
+            color: var(--text-muted) !important;
+            font-size: 0.75rem !important;
+            font-weight: 600 !important;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        /* ---------- CODE / LOGS ---------- */
+        code, pre {
+            font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
+            background: var(--surface-3) !important;
+            color: var(--text) !important;
+            border-radius: 6px !important;
+            font-size: 0.85rem !important;
+        }
+        .stCodeBlock {
+            background: #0f172a !important;
+            border: 1px solid #1e293b !important;
+            border-radius: var(--radius-md) !important;
+        }
+        .stCodeBlock pre, .stCodeBlock code {
+            background: transparent !important;
+            color: #e2e8f0 !important;
+        }
+
+        /* ---------- PRODUCT CARD (preserve existing classnames) ---------- */
+        .product-card {
+            background: var(--surface);
+            border-radius: var(--radius-lg);
+            box-shadow: var(--shadow-lg);
+            border: 1px solid var(--border);
+            overflow: hidden;
+            margin-top: 1rem;
+        }
+        .product-header {
+            padding: 1.25rem 1.75rem;
+            background: linear-gradient(135deg, #fafafa, #ffffff);
+            border-bottom: 1px solid var(--border);
+        }
+        .product-title { font-size: 1.25rem; font-weight: 700; color: var(--text); margin: 0; line-height: 1.4; }
+        .product-body { display: flex; padding: 1.75rem; gap: 2rem; flex-wrap: wrap; }
+        .product-image-container { flex: 0 0 320px; max-width: 100%; }
+        .product-image { width: 100%; border-radius: var(--radius-md); object-fit: contain; background: var(--surface-3); aspect-ratio: 1; box-shadow: var(--shadow-sm); }
+        .product-details { flex: 1; min-width: 280px; }
+        .price-tag { font-size: 2.25rem; font-weight: 800; color: var(--text); margin-bottom: 0.5rem; letter-spacing: -0.03em; background: linear-gradient(135deg, #0f172a, #6366f1); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+        .detail-row { display: flex; align-items: flex-start; padding: 0.65rem 0; border-bottom: 1px solid var(--surface-3); }
+        .detail-label { font-weight: 600; color: var(--text-muted); width: 110px; flex-shrink: 0; font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.05em; }
+        .detail-value { color: var(--text); font-size: 0.95rem; line-height: 1.5; }
+        .status-section { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 1.25rem; padding-top: 1rem; border-top: 1px dashed var(--border); }
+        .status-badge { display: inline-flex; align-items: center; padding: 0.3rem 0.75rem; border-radius: var(--radius-pill); font-size: 0.78rem; font-weight: 600; background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
+        .status-badge.neutral { background: var(--surface-3); color: var(--text-soft); border-color: var(--border); }
+
+        /* ---------- SLIDERS ---------- */
         .stSlider [role="slider"] {
-          background: #000000 !important;
-          box-shadow: 0 0 0 4px rgba(0, 0, 0, 0.1) !important;
-          width: 20px !important;
-          height: 20px !important;
-          transition: all 0.3s ease !important;
-          cursor: pointer !important;
+            background: var(--brand) !important;
+            box-shadow: 0 0 0 4px rgba(15, 23, 42, 0.1) !important;
+            width: 18px !important;
+            height: 18px !important;
         }
-        
-        .stSlider [data-baseweb="slider"] > div:first-child > div {
-          background: #e5e7eb !important;
-          height: 6px !important;
-          border-radius: 3px !important;
+        .stSlider [data-baseweb="slider"] > div:first-child > div { background: var(--surface-3) !important; height: 5px !important; border-radius: 3px !important; }
+        .stSlider [data-baseweb="slider"] > div:first-child > div > div { background: linear-gradient(90deg, var(--accent), var(--accent-2)) !important; }
+        .stSlider [role="slider"]:hover { transform: scale(1.15) !important; }
+
+        /* ---------- CHECKBOXES & RADIOS ---------- */
+        .stCheckbox label, .stRadio label { color: var(--text) !important; font-weight: 500 !important; }
+
+        /* ---------- DATAFRAME ---------- */
+        [data-testid="stDataFrame"] { border: 1px solid var(--border) !important; border-radius: var(--radius-md) !important; overflow: hidden; box-shadow: var(--shadow-sm); }
+
+        /* ---------- SCROLLBARS ---------- */
+        ::-webkit-scrollbar { width: 10px; height: 10px; }
+        ::-webkit-scrollbar-track { background: var(--surface-2); }
+        ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px; border: 2px solid var(--surface-2); }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+        /* ---------- ANIMATIONS ---------- */
+        @keyframes fadeInUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .es-card, .product-card, .es-hero, .stAlert { animation: fadeInUp 0.35s ease-out; }
+
+        /* ---------- RESPONSIVE ---------- */
+        @media (max-width: 768px) {
+            .block-container { padding: 1rem !important; }
+            .es-hero { padding: 1.25rem; }
+            .product-body { padding: 1rem; gap: 1rem; }
+            .product-image-container { flex: 1 1 100%; }
         }
-        
-        .stSlider [data-baseweb="slider"] > div:first-child > div > div {
-          background: #000000 !important;
-          height: 6px !important;
-          border-radius: 3px !important;
+
+        /* ---------- CHAT (preserve existing) ---------- */
+        .chat-container { display:flex; flex-direction:column; height:600px; border:1px solid var(--border); border-radius: var(--radius-md); overflow:hidden; background: var(--surface); }
+        .chat-messages { flex:1; overflow-y:auto; padding:1rem; background: var(--surface-2); }
+        .chat-message { margin-bottom: 0.25rem; padding: 0.15rem 0; animation: fadeIn 0.2s ease-in; }
+
+        /* ---------- DIVIDERS ---------- */
+        hr { border: none !important; border-top: 1px solid var(--border) !important; margin: 1.25rem 0 !important; }
+
+        /* ---------- FILE UPLOADER ---------- */
+        [data-testid="stFileUploader"] section {
+            background: var(--surface) !important;
+            border: 2px dashed var(--border-strong) !important;
+            border-radius: var(--radius-md) !important;
+            padding: 1.25rem !important;
+            transition: all 0.2s ease !important;
         }
-        
-        .stSlider [role="slider"]:hover {
-          transform: scale(1.15) !important;
-          box-shadow: 0 0 0 6px rgba(0, 0, 0, 0.15) !important;
-        }
-        
-        .stSlider label {
-          color: #000000 !important;
-          font-weight: 600 !important;
-          font-size: 0.9rem !important;
-          margin-bottom: 0.75rem !important;
-        }
-        
-        /* Slider value display */
-        .stSlider [data-testid="stTickBar"] {
-          color: #6b7280 !important;
-          font-size: 0.85rem !important;
-        }
-        
-        .stSlider .rc-slider-rail {
-          background: var(--bg-tertiary) !important;
-          height: 6px !important;
-        }
-        
-        /* Custom scrollbar */
-        ::-webkit-scrollbar {
-          width: 12px !important;
-          height: 12px !important;
-        }
-        
-        ::-webkit-scrollbar-track {
-          background: var(--bg-secondary) !important;
-        }
-        
-        ::-webkit-scrollbar-thumb {
-          background: var(--bg-tertiary) !important;
-          border-radius: 6px !important;
-          border: 2px solid var(--bg-secondary) !important;
-        }
-        
-        ::-webkit-scrollbar-thumb:hover {
-          background: var(--surface-hover) !important;
-        }
-        
-        /* Hide Streamlit branding */
-        #MainMenu { visibility: hidden !important; }
-        footer { visibility: hidden !important; }
-        header { visibility: hidden !important; }
-        
-        /* Animations */
-        @keyframes fadeIn {
-          from { opacity: 0; }
-          to { opacity: 1; }
-        }
-        
-        @keyframes fadeInUp {
-          from {
-            opacity: 0;
-            transform: translateY(20px);
-          }
-          to {
-            opacity: 1;
-            transform: translateY(0);
-          }
-        }
-        
-        @keyframes fadeInScale {
-          from {
-            opacity: 0;
-            transform: scale(0.95);
-          }
-          to {
-            opacity: 1;
-            transform: scale(1);
-          }
-        }
-        
-        @keyframes slideInLeft {
-          from {
-            opacity: 0;
-            transform: translateX(-20px);
-          }
-          to {
-            opacity: 1;
-            transform: translateX(0);
-          }
-        }
-        
-        @keyframes gradientShift {
-          0%, 100% { background-position: 0% 50%; }
-          50% { background-position: 100% 50%; }
-        }
-        
-        @keyframes pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.7; }
-        }
-        
-        @keyframes spin {
-          to { transform: rotate(360deg); }
-        }
-        
-        @keyframes shimmer {
-          0% { background-position: -1000px 0; }
-          100% { background-position: 1000px 0; }
-        }
-        
-        /* Success animation overlay */
-        @keyframes successPulse {
-          0% {
-            box-shadow: 0 0 0 0 var(--success-glow);
-          }
-          50% {
-            box-shadow: 0 0 0 20px rgba(34, 197, 94, 0);
-          }
-          100% {
-            box-shadow: 0 0 0 0 rgba(34, 197, 94, 0);
-          }
-        }
-        
-        .success-animation {
-          animation: successPulse 1s ease-out !important;
-        }
-        
-        /* Loading skeleton */
-        .skeleton {
-          background: linear-gradient(90deg, var(--bg-tertiary) 25%, var(--surface-hover) 50%, var(--bg-tertiary) 75%) !important;
-          background-size: 1000px 100% !important;
-          animation: shimmer 2s infinite !important;
-          border-radius: 8px !important;
+        [data-testid="stFileUploader"] section:hover {
+            border-color: var(--accent) !important;
+            background: rgba(99, 102, 241, 0.03) !important;
         }
         </style>
         """,
@@ -3652,17 +3594,32 @@ def display_scraping_results(result: ScrapingResult, downloaded_images: List[str
 
 def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manager: FileManager):
     """
-    Orchestrates the single product scraping flow.
+    Orchestrates the single product scraping flow with full edge-case handling.
     """
-    if not ebay_url:
-        st.error("⚠️ Please enter a valid eBay URL to begin.")
+    # Edge case: empty/whitespace input
+    if not ebay_url or not ebay_url.strip():
+        st.error("⚠️ Please paste an eBay product URL before clicking Start scraping.")
         return
 
-    # 1. Validation
+    ebay_url = ebay_url.strip()
+
+    # Edge case: pasted with surrounding quotes / angle brackets (common mistake)
+    ebay_url = ebay_url.strip('<>"\'')
+
+    # Edge case: pasted multiple URLs separated by whitespace — use the first one
+    if any(ws in ebay_url for ws in (' ', '\t', '\n')):
+        parts = [p for p in re.split(r'\s+', ebay_url) if p]
+        if parts:
+            ebay_url = parts[0]
+            if len(parts) > 1:
+                st.info(f"Detected multiple URLs — using the first one. Use the **Batch Processing** tab for {len(parts)} URLs at once.")
+
+    # 1. Validation with a user-friendly error
     try:
         scraper.validate_ebay_url(ebay_url)
     except ValidationError as e:
-        st.error(f"❌ URL Validation Error: {e}")
+        st.error(f"❌ Invalid URL — {e}")
+        st.caption("See **Supported URL formats** above for examples.")
         return
 
     # 2. Operations
@@ -3739,7 +3696,17 @@ def main():
     )
     inject_global_styles()
     
-    st.markdown("<div style='text-align: center; padding: 2rem 0; margin-bottom: 2rem;'><h1 style='color: #000000; font-size: 2.5rem; font-weight: 700; font-family: Arial, Helvetica, sans-serif; margin: 0;'>EBAY SCRAPER</h1></div>", unsafe_allow_html=True)
+    # Custom hero header (replaces the plain centered H1)
+    st.markdown(
+        """
+        <div class="es-hero">
+            <div class="es-badge">v3.2 · Multi-platform</div>
+            <h1>eBay Scraper Studio</h1>
+            <p>Extract listings, enhance images and generate platform-tuned descriptions — all in one place.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     
     # Initialize components
     try:
@@ -3748,72 +3715,131 @@ def main():
         st.error(f"❌ Failed to initialize application: {e}")
         return
 
-    # Sidebar configuration
+    # Sidebar: brand + navigation + configuration. The sidebar can be
+    # collapsed/expanded by the user via Streamlit's built-in chevron control.
+    NAV_OPTIONS = [
+        ("Single Product", "🔍"),
+        ("Batch Processing", "📦"),
+        ("AI Processing", "🤖"),
+        ("Image Enhancement", "🎨"),
+        ("Image Format", "🖼️"),
+        ("Logs", "📜"),
+    ]
+
     with st.sidebar:
-        st.header("Configuration")
+        st.markdown(
+            """
+            <div class="es-side-brand">
+                <div class="es-logo">eS</div>
+                <div>
+                    <div class="es-side-title">eBay Studio</div>
+                    <div class="es-side-sub">Scraper · AI · Images</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        st.info("Storage: Local CSV (EbayStore_Products.csv)")
+        st.markdown('<div class="es-side-section">Navigation</div>', unsafe_allow_html=True)
+        _page = st.radio(
+            "Navigation",
+            options=[f"{ico}  {name}" for name, ico in NAV_OPTIONS],
+            label_visibility="collapsed",
+            key="es_nav",
+        )
+        # Strip the icon prefix to get the canonical page name
+        active_page = _page.split("  ", 1)[1] if _page else NAV_OPTIONS[0][0]
 
-        # Groq API configuration
-        st.subheader("AI Processing")
+        st.markdown('<div class="es-side-section">Configuration</div>', unsafe_allow_html=True)
+        st.caption("Storage: Local CSV (EbayStore_Products.csv)")
+
         stored_key = load_groq_api_key()
         groq_api_key = st.text_input(
             "Groq API Key",
             value=stored_key,
             type="password",
-            help="Required for AI content processing"
+            help="Required for AI features"
         )
-        save_key = st.checkbox("Save API key to this project (persistent)", value=bool(groq_api_key))
+        save_key = st.checkbox(
+            "Persist API key to this project",
+            value=bool(groq_api_key),
+            help="Stores the key in a local file in this folder",
+        )
         if save_key and groq_api_key and groq_api_key != stored_key:
             if save_groq_api_key(groq_api_key):
-                st.success("API key saved locally")
+                st.success("API key saved", icon="✅")
             else:
                 st.warning("Could not save API key locally")
-        
+
         if groq_api_key:
-            st.success("Groq API key set")
+            st.success("Groq API key configured", icon="🤖")
         else:
-            st.info("Add API key for AI features")
-    
-    # Main application tabs
-    tab1, tab2, tab3, tab4, tab_fmt, tab5 = st.tabs(["Single Product", "Batch Processing", "AI Processing", "Image Enhancement", "Image Format", "Logs"])
+            st.info("Add API key to unlock AI features", icon="🔑")
+
+        st.markdown('<div class="es-side-section">About</div>', unsafe_allow_html=True)
+        st.caption("Tip: use the chevron at the top-left of the sidebar to collapse this panel.")
+
+    # Sidebar nav selects which tab is shown. We still use Streamlit's native
+    # st.tabs() under the hood so the existing `with tabX:` blocks below
+    # continue to work unchanged. The page label drives which tab opens by
+    # default via the index argument. Tabs themselves are restyled as pills.
+    page_names = [name for name, _ in NAV_OPTIONS]
+    try:
+        _default_idx = page_names.index(active_page)
+    except ValueError:
+        _default_idx = 0
+
+    # The visible tab list still lets users click between sections at the top.
+    tab1, tab2, tab3, tab4, tab_fmt, tab5 = st.tabs(
+        [f"{ico}  {name}" for name, ico in NAV_OPTIONS]
+    )
     
     # Tab 1: Single Product Scraping
     with tab1:
-        st.markdown("""
-        <div style='background: linear-gradient(to right, #ffffff, #f9fafb); padding: 2rem; border-radius: 12px; border: 1px solid #e5e7eb; margin-bottom: 2rem; text-align: center;'>
-            <h2 style='margin-bottom: 0.5rem; color: #111827;'>Find Product</h2>
-            <p style='color: #6b7280; margin-bottom: 1.5rem;'>Paste an eBay URL to automatically extract data, download images, and update your records.</p>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            """
+            <div class="es-card">
+                <div class="es-card-title">🔍 Find a product</div>
+                <p class="es-card-sub">Paste any eBay listing URL — regional domains, short links (ebay.to), product pages and item URLs with tracking params are all supported.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
         col_search_1, col_search_2 = st.columns([4, 1])
-        
+
         with col_search_1:
             ebay_url = st.text_input(
                 "eBay Product URL",
-                placeholder="https://www.ebay.com/itm/1234567890",
-                label_visibility="collapsed"
+                placeholder="https://www.ebay.com/itm/1234567890 or https://ebay.to/abc123",
+                label_visibility="collapsed",
+                key="single_url_input",
             )
 
         with col_search_2:
             scrape_button = st.button(
-                "Start Scraping",
+                "Start scraping",
                 type="primary",
-                use_container_width=True
+                use_container_width=True,
+                key="single_scrape_btn",
             )
-            
+
         if scrape_button:
             handle_single_product_scrape(ebay_url, scraper, file_manager)
-            
-        # Recent/Footer info or features could go here
-        st.write("")
-        st.markdown("---")
-        st.markdown("""
-        <div style='text-align: center; color: #9ca3af; font-size: 0.85rem;'>
-            Supports eBay.com listings using regular item format.
-        </div>
-        """, unsafe_allow_html=True)
+
+        # Supported formats helper
+        with st.expander("Supported URL formats", expanded=False):
+            st.markdown(
+                """
+- **Item URL** — `https://www.ebay.com/itm/1234567890`
+- **Item URL with slug** — `https://www.ebay.com/itm/some-product-name/1234567890`
+- **Regional domains** — `.com`, `.co.uk`, `.de`, `.fr`, `.it`, `.es`, `.com.au`, `.ca`, `.ie`, `.nl`, `.pl`, `.com.hk`, `.com.sg`, `.co.jp`
+- **Short links** — `https://ebay.to/abc123` (auto-resolved)
+- **Product pages** — `https://www.ebay.com/p/12345678`
+- **URLs with tracking params** — `?_trkparms=...`, `?hash=item123:...` are stripped automatically
+- **Mobile URLs** — `https://m.ebay.com/itm/...`
+                """
+            )
     
     # Tab 2: Batch Processing
     with tab2:
