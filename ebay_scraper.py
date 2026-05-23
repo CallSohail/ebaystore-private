@@ -3014,14 +3014,46 @@ def inject_global_styles() -> None:
             --radius-pill: 999px;
         }
 
-        html, body, .stApp, [class*="st-emotion"] {
+        html, body, .stApp {
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
             font-feature-settings: "ss01", "cv11";
         }
         .stApp { background: var(--bg) !important; color: var(--text) !important; }
 
-        /* Hide Streamlit chrome */
-        #MainMenu, footer, header[data-testid="stHeader"] { visibility: hidden !important; height: 0 !important; }
+        /* Preserve icon fonts — DO NOT override Material Symbols/Icons with Inter */
+        i, span.material-icons, span.material-icons-outlined,
+        span.material-symbols-rounded, span.material-symbols-outlined,
+        [class*="material-icons"], [class*="material-symbols"],
+        [data-baseweb="icon"], .icon {
+            font-family: 'Material Symbols Rounded', 'Material Symbols Outlined', 'Material Icons', 'Material Icons Outlined' !important;
+            font-feature-settings: normal !important;
+        }
+        svg { font-family: inherit; }
+
+        /* Hide Streamlit chrome but keep the sidebar toggle visible */
+        #MainMenu, footer { visibility: hidden !important; height: 0 !important; }
+        header[data-testid="stHeader"] {
+            background: transparent !important;
+            height: 0 !important;
+        }
+        /* Keep the sidebar collapse/expand control visible & on top */
+        [data-testid="collapsedControl"], [data-testid="stSidebarCollapsedControl"] {
+            visibility: visible !important;
+            display: flex !important;
+            z-index: 999 !important;
+        }
+        [data-testid="collapsedControl"] button,
+        [data-testid="stSidebarCollapsedControl"] button {
+            background: var(--brand) !important;
+            color: white !important;
+            border-radius: 10px !important;
+            box-shadow: var(--shadow-md) !important;
+        }
+        [data-testid="collapsedControl"] svg,
+        [data-testid="stSidebarCollapsedControl"] svg {
+            fill: white !important;
+            color: white !important;
+        }
 
         /* ---------- LAYOUT ---------- */
         .block-container {
@@ -3618,28 +3650,27 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
     try:
         scraper.validate_ebay_url(ebay_url)
     except ValidationError as e:
-        st.error(f"❌ Invalid URL — {e}")
+        st.error(f"Invalid URL — {e}")
         st.caption("See **Supported URL formats** above for examples.")
         return
 
     # 2. Operations
     progress_bar = st.progress(0)
     status_msg = st.empty()
-    
+
     try:
-        # SCRAPE
-        status_msg.markdown("**🔍 Extracting product data...**")
+        status_msg.markdown("**Extracting product data...**")
         progress_bar.progress(10)
-        
+
         result = scraper.scrape_product(ebay_url)
-        
+
         if not result.success:
-            status_msg.error(f"❌ Failed: {result.error_message}")
+            status_msg.error(f"Failed: {result.error_message}")
             progress_bar.empty()
             return
-            
+
         progress_bar.progress(40)
-        status_msg.markdown("**📁 Setting up project workspace...**")
+        status_msg.markdown("**Setting up project workspace...**")
         
         # FSYSOPS
         folder_path = file_manager.create_product_folder(
@@ -3654,9 +3685,8 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
         file_manager.save_raw_scrape_text(result.product_data, folder_path)
         
         progress_bar.progress(60)
-        status_msg.markdown(f"**📸 Downloading {len(result.image_urls)} high-res images...**")
-        
-        # IMAGES
+        status_msg.markdown(f"**Downloading {len(result.image_urls)} high-res images...**")
+
         downloaded_images = []
         if result.image_urls:
             downloaded = file_manager.download_images(
@@ -3664,27 +3694,21 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
                 progress_callback=lambda c, t: progress_bar.progress(60 + int((c/t)*20))
             )
             downloaded_images = downloaded
-        
-        progress_bar.progress(85)
-        status_msg.markdown("**📊 Saving to local CSV...**")
 
-        # CSV
+        progress_bar.progress(85)
+        status_msg.markdown("**Saving to local CSV...**")
         csv_updated = append_to_local_csv(result.product_data)
 
         progress_bar.progress(100)
-        status_msg.markdown("✅ **Success! Processing Complete.**")
-        time.sleep(1)
-        status_msg.empty() # Clear status
-        progress_bar.empty() # Clear progress
+        status_msg.markdown("**Done.**")
+        time.sleep(0.6)
+        status_msg.empty()
+        progress_bar.empty()
 
-        # DISPLAY
         display_scraping_results(result, downloaded_images, folder_path, csv_updated)
-        
-        # Confetti
-        st.balloons()
-        
+
     except Exception as e:
-        status_msg.error(f"❌ An unexpected error occurred: {str(e)}")
+        status_msg.error(f"Unexpected error: {str(e)}")
         logger.error(f"Scrape handler error: {traceback.format_exc()}")
 
 def main():
@@ -3696,13 +3720,13 @@ def main():
     )
     inject_global_styles()
     
-    # Custom hero header (replaces the plain centered H1)
+    # Custom hero header
     st.markdown(
         """
         <div class="es-hero">
-            <div class="es-badge">v3.2 · Multi-platform</div>
+            <div class="es-badge">Multi-platform · v3.2</div>
             <h1>eBay Scraper Studio</h1>
-            <p>Extract listings, enhance images and generate platform-tuned descriptions — all in one place.</p>
+            <p>Extract listings, enhance images and generate platform-tuned descriptions.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3718,12 +3742,12 @@ def main():
     # Sidebar: brand + navigation + configuration. The sidebar can be
     # collapsed/expanded by the user via Streamlit's built-in chevron control.
     NAV_OPTIONS = [
-        ("Single Product", "🔍"),
-        ("Batch Processing", "📦"),
-        ("AI Processing", "🤖"),
-        ("Image Enhancement", "🎨"),
-        ("Image Format", "🖼️"),
-        ("Logs", "📜"),
+        "Single Product",
+        "Batch Processing",
+        "AI Processing",
+        "Image Enhancement",
+        "Image Format",
+        "Logs",
     ]
 
     with st.sidebar:
@@ -3740,67 +3764,43 @@ def main():
             unsafe_allow_html=True,
         )
 
-        st.markdown('<div class="es-side-section">Navigation</div>', unsafe_allow_html=True)
-        _page = st.radio(
-            "Navigation",
-            options=[f"{ico}  {name}" for name, ico in NAV_OPTIONS],
-            label_visibility="collapsed",
-            key="es_nav",
-        )
-        # Strip the icon prefix to get the canonical page name
-        active_page = _page.split("  ", 1)[1] if _page else NAV_OPTIONS[0][0]
-
         st.markdown('<div class="es-side-section">Configuration</div>', unsafe_allow_html=True)
-        st.caption("Storage: Local CSV (EbayStore_Products.csv)")
+        st.caption("Storage: local CSV (EbayStore_Products.csv)")
 
         stored_key = load_groq_api_key()
         groq_api_key = st.text_input(
-            "Groq API Key",
+            "Groq API key",
             value=stored_key,
             type="password",
-            help="Required for AI features"
+            help="Required for AI features",
         )
         save_key = st.checkbox(
-            "Persist API key to this project",
+            "Save key to this project",
             value=bool(groq_api_key),
             help="Stores the key in a local file in this folder",
         )
         if save_key and groq_api_key and groq_api_key != stored_key:
             if save_groq_api_key(groq_api_key):
-                st.success("API key saved", icon="✅")
+                st.success("Saved")
             else:
-                st.warning("Could not save API key locally")
+                st.warning("Could not save key locally")
 
         if groq_api_key:
-            st.success("Groq API key configured", icon="🤖")
+            st.success("Groq key set")
         else:
-            st.info("Add API key to unlock AI features", icon="🔑")
+            st.info("Add key to enable AI features")
 
-        st.markdown('<div class="es-side-section">About</div>', unsafe_allow_html=True)
-        st.caption("Tip: use the chevron at the top-left of the sidebar to collapse this panel.")
-
-    # Sidebar nav selects which tab is shown. We still use Streamlit's native
-    # st.tabs() under the hood so the existing `with tabX:` blocks below
-    # continue to work unchanged. The page label drives which tab opens by
-    # default via the index argument. Tabs themselves are restyled as pills.
-    page_names = [name for name, _ in NAV_OPTIONS]
-    try:
-        _default_idx = page_names.index(active_page)
-    except ValueError:
-        _default_idx = 0
-
-    # The visible tab list still lets users click between sections at the top.
-    tab1, tab2, tab3, tab4, tab_fmt, tab5 = st.tabs(
-        [f"{ico}  {name}" for name, ico in NAV_OPTIONS]
-    )
+    # Native Streamlit tabs handle navigation in the main area; the sidebar
+    # holds configuration only. Tabs are restyled as pills via CSS.
+    tab1, tab2, tab3, tab4, tab_fmt, tab5 = st.tabs(NAV_OPTIONS)
     
     # Tab 1: Single Product Scraping
     with tab1:
         st.markdown(
             """
             <div class="es-card">
-                <div class="es-card-title">🔍 Find a product</div>
-                <p class="es-card-sub">Paste any eBay listing URL — regional domains, short links (ebay.to), product pages and item URLs with tracking params are all supported.</p>
+                <div class="es-card-title">Find a product</div>
+                <p class="es-card-sub">Paste any eBay listing URL. Regional domains, short links, product pages and URLs with tracking parameters are all supported.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -3811,7 +3811,7 @@ def main():
         with col_search_1:
             ebay_url = st.text_input(
                 "eBay Product URL",
-                placeholder="https://www.ebay.com/itm/1234567890 or https://ebay.to/abc123",
+                placeholder="https://www.ebay.com/itm/1234567890",
                 label_visibility="collapsed",
                 key="single_url_input",
             )
@@ -3827,17 +3827,16 @@ def main():
         if scrape_button:
             handle_single_product_scrape(ebay_url, scraper, file_manager)
 
-        # Supported formats helper
         with st.expander("Supported URL formats", expanded=False):
             st.markdown(
                 """
-- **Item URL** — `https://www.ebay.com/itm/1234567890`
-- **Item URL with slug** — `https://www.ebay.com/itm/some-product-name/1234567890`
-- **Regional domains** — `.com`, `.co.uk`, `.de`, `.fr`, `.it`, `.es`, `.com.au`, `.ca`, `.ie`, `.nl`, `.pl`, `.com.hk`, `.com.sg`, `.co.jp`
-- **Short links** — `https://ebay.to/abc123` (auto-resolved)
-- **Product pages** — `https://www.ebay.com/p/12345678`
-- **URLs with tracking params** — `?_trkparms=...`, `?hash=item123:...` are stripped automatically
-- **Mobile URLs** — `https://m.ebay.com/itm/...`
+- **Item URL** &nbsp;`https://www.ebay.com/itm/1234567890`
+- **With slug** &nbsp;`https://www.ebay.com/itm/some-product-name/1234567890`
+- **Regional domains** &nbsp;`.com`, `.co.uk`, `.de`, `.fr`, `.it`, `.es`, `.com.au`, `.ca`, `.ie`, `.nl`, `.pl`, `.com.hk`, `.com.sg`, `.co.jp`
+- **Short links** &nbsp;`https://ebay.to/abc123` (auto-resolved)
+- **Product pages** &nbsp;`https://www.ebay.com/p/12345678`
+- **With tracking params** &nbsp;`?_trkparms=...`, `?hash=item123:...` (stripped automatically)
+- **Mobile URLs** &nbsp;`https://m.ebay.com/itm/...`
                 """
             )
     
@@ -4744,84 +4743,83 @@ def main():
 
     # Tab 5: Logs
     with tab5:
-        st.subheader("📝 System Logs")
-        
+        st.markdown(
+            """
+            <div class="es-card">
+                <div class="es-card-title">System logs</div>
+                <p class="es-card-sub">Last 50 lines from ebay_scraper.log.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
         col_l1, col_l2 = st.columns([4, 1])
-        with col_l1:
-            log_lines = 50
         with col_l2:
-            if st.button("🔄 Refresh Logs"):
+            if st.button("Refresh", use_container_width=True, key="logs_refresh"):
                 st.rerun()
-                
+
         try:
             if os.path.exists(log_filename):
                 with open(log_filename, "r", encoding='utf-8') as f:
                     lines = f.readlines()
-                    last_lines = lines[-50:]
-                    log_content = "".join(last_lines)
-                    st.code(log_content, language="text")
-                    
+                    log_content = "".join(lines[-50:])
+                st.code(log_content or "(empty)", language="text")
+
                 with open(log_filename, "rb") as f:
-                    st.download_button("💾 Download Full Log", f, file_name="ebay_scraper.log")
+                    st.download_button("Download full log", f, file_name="ebay_scraper.log", use_container_width=False)
             else:
                 st.info("No logs found yet.")
         except Exception as e:
             st.error(f"Error reading logs: {e}")
-            
-    # Footer
-    st.markdown("---")
-    st.markdown("---")
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        # Zip Download Feature
-        if st.button("📥 Download All Data (ZIP)"):
+
+    # Sidebar utilities (placed under the Configuration block so they don't
+    # repeat under every tab). Keeps the main area clean and focused.
+    with st.sidebar:
+        st.markdown('<div class="es-side-section">Data</div>', unsafe_allow_html=True)
+
+        if st.button("Download all data (ZIP)", use_container_width=True, key="sb_zip_btn"):
             with st.spinner("Zipping files..."):
                 try:
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                     zip_path = Path.cwd() / f"ebay_data_{timestamp}"
                     shutil.make_archive(str(zip_path), 'zip', Path.cwd() / BASE_SAVE_DIR)
-                    
                     with open(f"{zip_path}.zip", "rb") as f:
                         st.download_button(
-                            label="💾 Confirm Download",
+                            label="Confirm download",
                             data=f,
                             file_name=f"ebay_data_{timestamp}.zip",
-                            mime="application/zip"
+                            mime="application/zip",
+                            use_container_width=True,
+                            key="sb_zip_confirm",
                         )
-                    st.success("Ready for download!")
+                    st.success("Archive ready")
                 except Exception as e:
-                    st.error(f"Failed to zip: {e}")
+                    st.error(f"Failed: {e}")
 
-    with col2:
-        # Safe Folder Opening (Local Only)
-        if st.button("📂 Open Downloads Folder (Local)"):
+        if st.button("Open downloads folder", use_container_width=True, key="sb_open_btn"):
             try:
                 import subprocess
-                import platform
-                
+                import platform as _platform
                 downloads_path = Path.cwd() / BASE_SAVE_DIR
-                
-                if platform.system() == "Windows":
+                downloads_path.mkdir(exist_ok=True)
+                sys_name = _platform.system()
+                if sys_name == "Windows":
                     subprocess.Popen(f'explorer "{downloads_path}"')
-                elif platform.system() == "Darwin":  # macOS
+                    st.success("Opened in Explorer")
+                elif sys_name == "Darwin":
                     subprocess.Popen(["open", str(downloads_path)])
-                else:  # Linux
-                    # Check if running in headless/cloud env (often no xdg-open)
+                    st.success("Opened in Finder")
+                else:
                     if os.getenv("Replit") or os.getenv("huggingface_spaces"):
-                        st.warning("Folder opening is not supported in this cloud environment. Please use the Download ZIP button.")
+                        st.warning("Not supported in this cloud environment. Use the ZIP download instead.")
                     else:
                         try:
                             subprocess.Popen(["xdg-open", str(downloads_path)])
-                        except:
-                            st.warning("Could not open folder automatically.")
-                    
-                if platform.system() in ["Windows", "Darwin"]:
-                    st.success("Downloads folder opened.")
+                            st.success("Opened in file manager")
+                        except Exception:
+                            st.warning("Could not open folder — use the ZIP download instead.")
             except Exception as e:
                 st.error(f"Could not open folder: {e}")
-    
-    # Removed verbose About section for a cleaner, minimalist UI
 
 if __name__ == "__main__":
     try:
