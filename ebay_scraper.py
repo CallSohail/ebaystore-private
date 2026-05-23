@@ -90,8 +90,19 @@ class NoProxyHTTPAdapter(HTTPAdapter):
 # =============================================================================
 
 # Browser-like headers to avoid anti-bot detection
+# Rotating pool of realistic desktop browser User-Agents. eBay's anti-bot
+# system flags repeated fingerprints, so each scraper instance picks a UA at
+# init time and additional retries pick a fresh one.
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0',
+]
+
 REQUEST_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'User-Agent': USER_AGENTS[0],
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
     'Accept-Encoding': 'gzip, deflate, br',
@@ -102,6 +113,9 @@ REQUEST_HEADERS = {
     'Sec-Fetch-Mode': 'navigate',
     'Sec-Fetch-Site': 'none',
     'Sec-Fetch-User': '?1',
+    'Sec-Ch-Ua': '"Google Chrome";v="131", "Chromium";v="131", "Not?A_Brand";v="24"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
     'Cache-Control': 'max-age=0',
 }
 
@@ -518,35 +532,63 @@ class DataExtractionError(ScrapingError):
 # UTILITY FUNCTIONS
 # =============================================================================
 
-def safe_request(session: requests.Session, url: str, timeout: int = 30, max_retries: int = 3) -> Optional[requests.Response]:
+def safe_request(session: requests.Session, url: str, timeout: int = 30, max_retries: int = 4,
+                 referer: Optional[str] = None) -> Optional[requests.Response]:
     """
-    Make a safe HTTP request with exponential backoff retry logic.
+    Make a safe HTTP request with exponential backoff and anti-bot mitigation.
+
+    On a 403/anti-bot block, rotates the User-Agent and resets the Sec-Fetch
+    headers as if the user had just navigated from the homepage. On a 404 we
+    do not blindly give up — eBay's bot defence often returns 404 to the
+    first scraped request even on live listings, so we retry once with a
+    fresh UA before treating it as a true not-found.
     """
+    last_status = 0
     for attempt in range(max_retries):
         try:
-            response = session.get(url, timeout=timeout)
+            # Per-attempt UA + referer rotation
+            ua = random.choice(USER_AGENTS)
+            session.headers['User-Agent'] = ua
+            session.headers['Sec-Fetch-Site'] = 'same-origin' if referer else 'none'
+            if referer:
+                session.headers['Referer'] = referer
+            elif 'Referer' in session.headers:
+                del session.headers['Referer']
+
+            response = session.get(url, timeout=timeout, allow_redirects=True)
+            last_status = response.status_code
             response.raise_for_status()
             return response
         except requests.exceptions.HTTPError as e:
-            status = e.response.status_code if e.response else 0
-            if status in [404, 410]: # Not found, don't retry
-                 logger.error(f"Page not found: {url}")
-                 return None
-            if status == 429: # Rate limit
-                wait_time = (2 ** attempt) + random.uniform(1, 3)
-                logger.warning(f"Rate limited. Waiting {wait_time:.2f}s...")
+            status = e.response.status_code if e.response is not None else 0
+            last_status = status
+            if status == 410:
+                logger.error(f"Listing permanently removed: {url}")
+                return None
+            if status == 404:
+                # eBay sometimes 404s to mask anti-bot blocks. Retry with a
+                # fresh UA after a short delay; only give up after attempt 1.
+                if attempt >= 1:
+                    logger.error(f"Page genuinely not found after retry: {url}")
+                    return None
+                logger.warning(f"404 on attempt {attempt + 1} — could be anti-bot, retrying with fresh UA")
+            elif status == 429:
+                wait_time = (2 ** attempt) + random.uniform(2, 5)
+                logger.warning(f"Rate limited (429). Waiting {wait_time:.1f}s...")
                 time.sleep(wait_time)
                 continue
-            logger.warning(f"HTTP error {e} on attempt {attempt + 1}")
+            elif status == 403:
+                logger.warning(f"403 Forbidden — anti-bot block, rotating UA (attempt {attempt + 1})")
+            else:
+                logger.warning(f"HTTP {status} on attempt {attempt + 1}: {e}")
         except requests.RequestException as e:
-            logger.warning(f"Request failed: {e}. Attempt {attempt + 1}/{max_retries}")
-        
-        # Exponential backoff
+            logger.warning(f"Request error on attempt {attempt + 1}/{max_retries}: {e}")
+
         if attempt < max_retries - 1:
-            sleep_time = (2 ** attempt) + random.uniform(0.5, 1.5)
+            sleep_time = (2 ** attempt) + random.uniform(1.0, 3.0)
             time.sleep(sleep_time)
-            
-    logger.error(f"Failed to fetch {url} after {max_retries} attempts")
+
+    logger.error(f"Failed to fetch {url} after {max_retries} attempts (last status: {last_status})")
     return None
 
 def clean_filename(filename: str, max_length: int = 100) -> str:
@@ -604,14 +646,39 @@ class EbayScraper:
     """
     
     def __init__(self):
-        """Initialize the scraper with configured session."""
+        """Initialize the scraper with a configured, anti-bot-aware session."""
         self.session = requests.Session()
-        # Configure session to bypass proxies
         self.session.mount('http://', NoProxyHTTPAdapter())
         self.session.mount('https://', NoProxyHTTPAdapter())
         self.session.proxies = {}
         self.session.headers.update(REQUEST_HEADERS)
+        self.session.headers['User-Agent'] = random.choice(USER_AGENTS)
+        self._warmed_hosts: set = set()
         logger.info("eBay scraper initialized")
+
+    def _warm_session(self, host: str) -> None:
+        """Hit the eBay homepage once per host so we pick up cookies.
+
+        eBay's bot defence will frequently 403 the very first request from a
+        new session, especially for /itm/ URLs without any prior cookies.
+        Visiting the homepage first gives us realistic cookies (e.g. dp1,
+        nonsession) which makes subsequent listing requests look like a
+        normal browse session.
+        """
+        if host in self._warmed_hosts:
+            return
+        try:
+            home_url = f"https://{host}/"
+            self.session.headers['Sec-Fetch-Site'] = 'none'
+            self.session.headers.pop('Referer', None)
+            r = self.session.get(home_url, timeout=15, allow_redirects=True)
+            if r.ok:
+                self._warmed_hosts.add(host)
+                logger.debug(f"Session warmed against {host}")
+            else:
+                logger.debug(f"Warm-up returned {r.status_code} for {host}")
+        except Exception as e:
+            logger.debug(f"Session warm-up failed for {host}: {e}")
     
     # Known eBay regional domains and short link hosts
     EBAY_DOMAINS = (
@@ -1372,17 +1439,33 @@ class EbayScraper:
             # Normalize to a canonical form when we can extract an item id
             url = self.normalize_ebay_url(url.strip())
 
-            # Add anti-detection delay
-            time.sleep(random.uniform(0.5, 2.0))
+            # Warm the session on the listing's host so we pick up cookies
+            # before requesting the /itm/ page. This dramatically reduces
+            # first-request 403s from eBay's anti-bot layer.
+            try:
+                host = urlparse(url).netloc or 'www.ebay.com'
+                self._warm_session(host)
+                referer = f"https://{host}/"
+            except Exception:
+                referer = "https://www.ebay.com/"
 
-            # Fetch page (requests follows redirects by default, handling ebay.to/ebay.us)
-            response = safe_request(self.session, url, timeout=30)
+            # Anti-detection delay (small humans aren't instant)
+            time.sleep(random.uniform(0.8, 2.2))
+
+            # Fetch page (requests follows redirects, handling ebay.to/ebay.us)
+            response = safe_request(self.session, url, timeout=30, referer=referer)
             if not response:
                 return ScrapingResult(
-                    success=False, 
-                    error_message="Could not connect to eBay. Please check:\n• Your internet connection is stable\n• The eBay listing still exists\n• Wait 1-2 minutes if you've made many requests"
+                    success=False,
+                    error_message=(
+                        "Could not load the listing. Likely reasons:\n"
+                        "• eBay is rate-limiting or anti-bot-blocking this IP — wait 2–5 minutes and try again.\n"
+                        "• The listing was sold, ended or removed.\n"
+                        "• You are behind a corporate / university proxy that blocks the request.\n"
+                        "• The URL is mis-typed (double-check the item ID)."
+                    )
                 )
-            
+
             # Check for eBay error pages
             if response.status_code == 404:
                 return ScrapingResult(
@@ -2107,23 +2190,32 @@ class FileManager:
         except Exception:
             return []
     
-    def create_product_folder(self, brand: str, item_id: str = "", fallback_title: str = "") -> Path:
-        """
-        Create and return product-specific folder path named "<Brand> <ItemID>".
+    def suggest_folder_name(self, brand: str, item_id: str = "", fallback_title: str = "") -> str:
+        """Return the auto-generated folder name without creating anything on disk."""
+        raw_brand = (brand or "").strip()
+        if not raw_brand:
+            first_word = (fallback_title or "").strip().split()[0:1]
+            raw_brand = first_word[0] if first_word else "Unknown"
+        brand_part = clean_filename(raw_brand, max_length=60) or "Unknown"
+        raw_id = str(item_id or "").strip()
+        id_part = clean_filename(raw_id, max_length=40) if raw_id else ""
+        return f"{brand_part} {id_part}".strip() if id_part else brand_part
 
-        Falls back to the first word of the title when brand is missing.
+    def create_product_folder(self, brand: str = "", item_id: str = "",
+                              fallback_title: str = "",
+                              custom_name: str = "") -> Path:
+        """
+        Create and return product-specific folder path.
+
+        If ``custom_name`` is provided (and non-empty after cleaning) it is used
+        verbatim; otherwise the folder is named "<Brand> <ItemID>", falling
+        back to the first word of the title when brand is missing.
         """
         try:
-            raw_brand = (brand or "").strip()
-            if not raw_brand:
-                first_word = (fallback_title or "").strip().split()[0:1]
-                raw_brand = first_word[0] if first_word else "Unknown"
-
-            brand_part = clean_filename(raw_brand, max_length=60) or "Unknown"
-            raw_id = str(item_id or "").strip()
-            id_part = clean_filename(raw_id, max_length=40) if raw_id else ""
-
-            folder_name = f"{brand_part} {id_part}".strip() if id_part else brand_part
+            if custom_name and custom_name.strip():
+                folder_name = clean_filename(custom_name.strip(), max_length=120) or self.suggest_folder_name(brand, item_id, fallback_title)
+            else:
+                folder_name = self.suggest_folder_name(brand, item_id, fallback_title)
 
             product_folder = self.base_dir / folder_name
             product_folder.mkdir(exist_ok=True)
@@ -2544,6 +2636,7 @@ def _add_to_batch_queue(urls: List[str], scraper: "EbayScraper", source_note: st
             'note': source_note,
             'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'error': '',
+            'folder_name': '',  # filled in by the user before processing (optional)
         })
         existing.add(url)
         added += 1
@@ -2666,20 +2759,52 @@ def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> Non
     m4.metric("Errors", len(error_items))
 
     if queue:
-        df_view = pd.DataFrame(queue)[['url', 'status', 'note', 'updated_at', 'error']]
-        df_view.columns = ['URL', 'Status', 'Source', 'Updated', 'Error']
-        st.dataframe(
+        # Ensure backward-compat: items written before folder_name was added
+        for it in queue:
+            it.setdefault('folder_name', '')
+
+        df_view = pd.DataFrame(queue)[['url', 'folder_name', 'status', 'note', 'updated_at', 'error']]
+        df_view.columns = ['URL', 'Folder name (optional)', 'Status', 'Source', 'Updated', 'Error']
+
+        st.caption(
+            "Edit **Folder name** to control where each scraped item is saved. "
+            "Leave it blank to use the auto-generated `<Brand> <ItemID>` name."
+        )
+
+        edited = st.data_editor(
             df_view,
             use_container_width=True,
             hide_index=True,
+            num_rows="fixed",
+            disabled=['URL', 'Status', 'Source', 'Updated', 'Error'],
             column_config={
                 "URL": st.column_config.LinkColumn("URL", width="large"),
+                "Folder name (optional)": st.column_config.TextColumn(
+                    "Folder name (optional)",
+                    width="medium",
+                    help="Custom subfolder under downloads/ for this item. Blank = auto-name.",
+                    max_chars=120,
+                ),
                 "Status": st.column_config.TextColumn("Status", width="small"),
-                "Source": st.column_config.TextColumn("Source", width="medium"),
+                "Source": st.column_config.TextColumn("Source", width="small"),
                 "Updated": st.column_config.TextColumn("Updated", width="medium"),
                 "Error": st.column_config.TextColumn("Error", width="medium"),
             },
+            key="bq_editor",
         )
+
+        # Persist any edits to folder names back into the queue.
+        if edited is not None:
+            names = list(edited['Folder name (optional)'])
+            changed = False
+            for idx, it in enumerate(st.session_state.batch_queue):
+                if idx < len(names):
+                    new_val = (names[idx] or '').strip()
+                    if new_val != it.get('folder_name', ''):
+                        it['folder_name'] = new_val
+                        changed = True
+            if changed:
+                save_batch_queue(st.session_state.batch_queue)
 
         # Queue management actions
         col_q1, col_q2, col_q3, col_q4 = st.columns(4)
@@ -2808,6 +2933,9 @@ def _run_batch(scraper: "EbayScraper", file_manager: "FileManager",
     counter = {"success": 0, "fail": 0, "completed": 0}
     total = len(pending_items)
 
+    # Map url -> user-chosen folder name (may be empty)
+    custom_names = {it['url']: (it.get('folder_name') or '').strip() for it in pending_items}
+
     def process_one(url: str) -> None:
         try:
             update_queue_status(url, 'Processing')
@@ -2817,6 +2945,7 @@ def _run_batch(scraper: "EbayScraper", file_manager: "FileManager",
                     brand=result.product_data.brand,
                     item_id=result.product_data.item_id,
                     fallback_title=result.product_data.title,
+                    custom_name=custom_names.get(url, ''),
                 )
                 file_manager.save_product_description_markdown(result.product_data, folder_path)
                 file_manager.save_product_text(result.product_data, folder_path)
@@ -3803,21 +3932,109 @@ def display_scraping_results(result: ScrapingResult, downloaded_images: List[str
                 st.warning("Could not open folder automatically.")
 
 
+def _save_scraped_product(result: ScrapingResult, folder_name: str,
+                          scraper: EbayScraper, file_manager: FileManager) -> Tuple[Path, List[str], bool]:
+    """Persist a scraped product under the user-chosen folder name.
+
+    Returns (folder_path, downloaded_images, csv_updated).
+    """
+    folder_path = file_manager.create_product_folder(
+        brand=result.product_data.brand,
+        item_id=result.product_data.item_id,
+        fallback_title=result.product_data.title,
+        custom_name=folder_name,
+    )
+    result.folder_path = str(folder_path)
+
+    file_manager.save_product_description_markdown(result.product_data, folder_path)
+    file_manager.save_product_text(result.product_data, folder_path)
+    file_manager.save_raw_scrape_text(result.product_data, folder_path)
+
+    downloaded_images: List[str] = []
+    if result.image_urls:
+        downloaded_images = file_manager.download_images(
+            scraper, result.image_urls, folder_path
+        )
+
+    csv_updated = append_to_local_csv(result.product_data)
+    return folder_path, downloaded_images, csv_updated
+
+
+@st.dialog("Name the folder", width="large")
+def _folder_name_dialog():
+    """Modal that asks the user for a folder name before saving the scrape."""
+    pending = st.session_state.get('pending_save')
+    if not pending:
+        st.warning("Nothing pending to save.")
+        if st.button("Close", key="dlg_close_empty"):
+            st.rerun()
+        return
+
+    result: ScrapingResult = pending['result']
+    pd_obj = result.product_data
+    suggested = pending['suggested']
+
+    st.caption("Preview of what was scraped — adjust the folder name if you like, then click Save.")
+
+    col_a, col_b = st.columns([1, 2])
+    with col_a:
+        if result.image_urls:
+            try:
+                st.image(result.image_urls[0], use_container_width=True)
+            except Exception:
+                st.caption("(no image preview)")
+    with col_b:
+        st.markdown(f"**{(pd_obj.title or '(no title)')[:120]}**")
+        meta_lines = []
+        if pd_obj.brand: meta_lines.append(f"**Brand** · {pd_obj.brand}")
+        if pd_obj.price: meta_lines.append(f"**Price** · {pd_obj.price}")
+        if pd_obj.condition: meta_lines.append(f"**Condition** · {pd_obj.condition}")
+        if pd_obj.item_id: meta_lines.append(f"**Item ID** · {pd_obj.item_id}")
+        st.markdown("  \n".join(meta_lines) or "_no metadata extracted_")
+
+    folder_name = st.text_input(
+        "Folder name",
+        value=st.session_state.get('pending_folder_name', suggested),
+        placeholder=suggested,
+        help="This is the folder under `downloads/` where text, CSV row and images will be saved.",
+        key="dlg_folder_name",
+    )
+
+    # Live validation feedback
+    safe_preview = clean_filename(folder_name.strip(), max_length=120) if folder_name.strip() else suggested
+    if (file_manager_path := Path.cwd() / BASE_SAVE_DIR / safe_preview).exists():
+        st.warning(f"Folder `{safe_preview}` already exists — files will be merged into it.")
+    else:
+        st.caption(f"Will be created at `downloads/{safe_preview}`")
+
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        if st.button("Save", type="primary", use_container_width=True, key="dlg_save_btn"):
+            st.session_state['confirmed_folder_name'] = folder_name.strip() or suggested
+            st.session_state['save_phase'] = 'persist'
+            st.rerun()
+    with c2:
+        if st.button("Use auto name", use_container_width=True, key="dlg_auto_btn"):
+            st.session_state['confirmed_folder_name'] = suggested
+            st.session_state['save_phase'] = 'persist'
+            st.rerun()
+    with c3:
+        if st.button("Cancel", use_container_width=True, key="dlg_cancel_btn"):
+            st.session_state['pending_save'] = None
+            st.session_state['save_phase'] = None
+            st.rerun()
+
+
 def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manager: FileManager):
-    """
-    Orchestrates the single product scraping flow with full edge-case handling.
-    """
+    """Orchestrate the single-product flow: scrape → prompt for folder name → save."""
     # Edge case: empty/whitespace input
     if not ebay_url or not ebay_url.strip():
         st.error("Please paste an eBay product URL before clicking Start scraping.")
         return
 
-    ebay_url = ebay_url.strip()
+    ebay_url = ebay_url.strip().strip('<>"\'')
 
-    # Edge case: pasted with surrounding quotes / angle brackets (common mistake)
-    ebay_url = ebay_url.strip('<>"\'')
-
-    # Edge case: pasted multiple URLs separated by whitespace — use the first one
+    # Multiple URLs pasted — use the first, point user at batch tab
     if any(ws in ebay_url for ws in (' ', '\t', '\n')):
         parts = [p for p in re.split(r'\s+', ebay_url) if p]
         if parts:
@@ -3825,7 +4042,7 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
             if len(parts) > 1:
                 st.info(f"Detected multiple URLs — using the first one. Use the **Batch Processing** tab for {len(parts)} URLs at once.")
 
-    # 1. Validation with a user-friendly error
+    # Validation
     try:
         scraper.validate_ebay_url(ebay_url)
     except ValidationError as e:
@@ -3833,13 +4050,12 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
         st.caption("See **Supported URL formats** above for examples.")
         return
 
-    # 2. Operations
     progress_bar = st.progress(0)
     status_msg = st.empty()
 
     try:
         status_msg.markdown("**Extracting product data...**")
-        progress_bar.progress(10)
+        progress_bar.progress(15)
 
         result = scraper.scrape_product(ebay_url)
 
@@ -3848,46 +4064,60 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
             progress_bar.empty()
             return
 
-        progress_bar.progress(40)
-        status_msg.markdown("**Setting up project workspace...**")
-        
-        # FSYSOPS
-        folder_path = file_manager.create_product_folder(
+        progress_bar.progress(60)
+        status_msg.markdown("**Ready — choose a folder name to continue.**")
+        time.sleep(0.3)
+        status_msg.empty()
+        progress_bar.empty()
+
+        # Stash the scrape result + suggested name in session state and open
+        # the modal. The dialog writes the user's choice to
+        # st.session_state['confirmed_folder_name'] and reruns; the run loop
+        # in tab1 picks that up and persists the files.
+        suggested = file_manager.suggest_folder_name(
             brand=result.product_data.brand,
             item_id=result.product_data.item_id,
             fallback_title=result.product_data.title,
         )
-        result.folder_path = str(folder_path)
-        
-        file_manager.save_product_description_markdown(result.product_data, folder_path)
-        file_manager.save_product_text(result.product_data, folder_path)
-        file_manager.save_raw_scrape_text(result.product_data, folder_path)
-        
-        progress_bar.progress(60)
-        status_msg.markdown(f"**Downloading {len(result.image_urls)} high-res images...**")
-
-        downloaded_images = []
-        if result.image_urls:
-            downloaded = file_manager.download_images(
-                scraper, result.image_urls, folder_path,
-                progress_callback=lambda c, t: progress_bar.progress(60 + int((c/t)*20))
-            )
-            downloaded_images = downloaded
-
-        progress_bar.progress(85)
-        status_msg.markdown("**Saving to local CSV...**")
-        csv_updated = append_to_local_csv(result.product_data)
-
-        progress_bar.progress(100)
-        status_msg.markdown("**Done.**")
-        time.sleep(0.6)
-        status_msg.empty()
-        progress_bar.empty()
-
-        display_scraping_results(result, downloaded_images, folder_path, csv_updated)
+        st.session_state['pending_save'] = {'result': result, 'suggested': suggested}
+        st.session_state['pending_folder_name'] = suggested
+        st.session_state['save_phase'] = 'awaiting_name'
+        st.rerun()
 
     except Exception as e:
         status_msg.error(f"Unexpected error: {str(e)}")
+        logger.error(f"Scrape handler error: {traceback.format_exc()}")
+
+
+def _persist_after_dialog(scraper: EbayScraper, file_manager: FileManager) -> None:
+    """If the dialog has been confirmed, write the files and render the result."""
+    pending = st.session_state.get('pending_save')
+    name = st.session_state.get('confirmed_folder_name')
+    if not pending or not name:
+        return
+
+    result: ScrapingResult = pending['result']
+    progress_bar = st.progress(0)
+    status_msg = st.empty()
+    try:
+        status_msg.markdown("**Saving files...**")
+        progress_bar.progress(30)
+        folder_path, downloaded_images, csv_updated = _save_scraped_product(
+            result, name, scraper, file_manager
+        )
+        progress_bar.progress(95)
+        status_msg.markdown("**Done.**")
+        time.sleep(0.4)
+        status_msg.empty()
+        progress_bar.empty()
+        display_scraping_results(result, downloaded_images, folder_path, csv_updated)
+    except Exception as e:
+        status_msg.error(f"Save failed: {e}")
+        logger.error(f"Save error: {traceback.format_exc()}")
+    finally:
+        st.session_state['pending_save'] = None
+        st.session_state['confirmed_folder_name'] = None
+        st.session_state['save_phase'] = None
         logger.error(f"Scrape handler error: {traceback.format_exc()}")
 
 def main():
@@ -4005,6 +4235,14 @@ def main():
 
         if scrape_button:
             handle_single_product_scrape(ebay_url, scraper, file_manager)
+
+        # Two-phase save: after a successful scrape we open a modal asking
+        # the user to confirm/customise the folder name, then persist.
+        save_phase = st.session_state.get('save_phase')
+        if save_phase == 'awaiting_name':
+            _folder_name_dialog()
+        elif save_phase == 'persist':
+            _persist_after_dialog(scraper, file_manager)
 
         with st.expander("Supported URL formats", expanded=False):
             st.markdown(
