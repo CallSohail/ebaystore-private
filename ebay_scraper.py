@@ -3810,6 +3810,180 @@ def inject_global_styles() -> None:
             border-color: var(--accent) !important;
             background: rgba(99, 102, 241, 0.03) !important;
         }
+
+        /* =====================================================================
+           THEME ROBUSTNESS
+           This app ships a single, polished light theme. The block below keeps
+           it readable even when Streamlit is switched to its built-in Dark
+           theme (Settings -> Appearance). It pins every surface and text colour
+           explicitly so nothing renders dark-text-on-dark or white-text-on-white
+           in any state — including the Name-the-folder dialog.
+           ===================================================================== */
+        :root { color-scheme: light !important; }
+        html, body, .stApp { color-scheme: light !important; }
+
+        .stApp, .main, .block-container,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"],
+        [data-testid="stHeader"] {
+            background: var(--bg) !important;
+            color: var(--text) !important;
+        }
+
+        .stApp p, .stApp li, .stApp label,
+        .stMarkdown, .stMarkdown p, .stMarkdown li,
+        [data-testid="stMarkdownContainer"],
+        [data-testid="stMarkdownContainer"] p,
+        [data-testid="stMarkdownContainer"] li,
+        [data-testid="stCaptionContainer"],
+        [data-testid="stWidgetLabel"],
+        [data-testid="stWidgetLabel"] p,
+        [data-testid="stWidgetLabel"] label {
+            color: var(--text) !important;
+        }
+
+        /* Selectbox + closed-state value */
+        .stSelectbox [data-baseweb="select"] div,
+        .stSelectbox [data-baseweb="select"] span,
+        .stSelectbox [data-baseweb="select"] input,
+        .stMultiSelect [data-baseweb="select"] div,
+        .stMultiSelect [data-baseweb="select"] span {
+            color: var(--text) !important;
+            -webkit-text-fill-color: var(--text) !important;
+        }
+        .stSelectbox [data-baseweb="select"] svg,
+        .stMultiSelect [data-baseweb="select"] svg {
+            fill: var(--text-soft) !important;
+        }
+
+        /* Dropdown options (rendered in body-level portal) */
+        div[data-baseweb="popover"],
+        div[data-baseweb="popover"] > div,
+        div[data-baseweb="popover"] [data-baseweb="menu"],
+        [data-baseweb="menu"],
+        ul[data-baseweb="menu"],
+        ul[role="listbox"],
+        [data-testid="stSelectboxVirtualDropdown"],
+        [data-testid="stVirtualDropdown"] {
+            background: var(--surface) !important;
+            color: var(--text) !important;
+        }
+        [data-baseweb="menu"] li,
+        ul[role="listbox"] li,
+        [role="option"],
+        [data-testid="stSelectboxVirtualDropdown"] li {
+            background: var(--surface) !important;
+            color: var(--text) !important;
+        }
+        [data-baseweb="menu"] li *,
+        [role="option"] * { color: var(--text) !important; }
+        [data-baseweb="menu"] li:hover,
+        [role="option"]:hover,
+        [data-baseweb="menu"] li[aria-selected="true"],
+        [role="option"][aria-selected="true"] {
+            background: var(--surface-3) !important;
+            color: var(--text) !important;
+        }
+
+        /* Inputs and textareas keep dark text on the light surface */
+        .stTextInput input, .stNumberInput input, .stTextArea textarea,
+        .stDateInput input,
+        [data-baseweb="input"] input, [data-baseweb="base-input"] input,
+        [data-baseweb="textarea"] textarea {
+            color: var(--text) !important;
+            -webkit-text-fill-color: var(--text) !important;
+            background: var(--surface) !important;
+        }
+
+        .stRadio label, .stCheckbox label,
+        [data-testid="stWidgetLabel"] { color: var(--text) !important; }
+
+        details[data-testid="stExpander"] div,
+        .stTabs [data-baseweb="tab-panel"] { color: var(--text) !important; }
+
+        div[data-baseweb="tooltip"], div[data-baseweb="tooltip"] * {
+            background: #0f172a !important;
+            color: #ffffff !important;
+        }
+
+        .stAlert, .stAlert p, .stAlert div, .stAlert span { color: var(--text) !important; }
+
+        /* =====================================================================
+           DIALOG / MODAL (e.g. "Name the folder")
+           st.dialog renders in a portal layered above the app. The base-web
+           modal styles inherit Streamlit's active theme, so when the user
+           switches to the Dark theme, the dialog body becomes near-black with
+           near-black text — see the "Name the folder" screenshot. We force the
+           same light palette here so the dialog is always readable.
+           ===================================================================== */
+        div[role="dialog"],
+        div[data-baseweb="modal"],
+        div[data-baseweb="dialog"],
+        [data-testid="stModal"],
+        [data-testid="stDialog"],
+        [data-testid="stDialog"] > div,
+        [data-testid="stModal"] > div {
+            background: var(--surface) !important;
+            color: var(--text) !important;
+            border-radius: var(--radius-lg) !important;
+            box-shadow: var(--shadow-lg) !important;
+        }
+        div[role="dialog"] *,
+        div[data-baseweb="modal"] *,
+        [data-testid="stModal"] *,
+        [data-testid="stDialog"] * {
+            color: var(--text) !important;
+        }
+        /* Headings inside the dialog (e.g. "Name the folder") */
+        div[role="dialog"] h1,
+        div[role="dialog"] h2,
+        div[role="dialog"] h3,
+        div[role="dialog"] h4,
+        [data-testid="stDialog"] h1,
+        [data-testid="stDialog"] h2,
+        [data-testid="stDialog"] h3,
+        [data-testid="stDialog"] h4 {
+            color: var(--text) !important;
+        }
+        /* Strong/bold lines (the "**Brand** · ...", "**Price** · ..." rows) */
+        div[role="dialog"] strong,
+        [data-testid="stDialog"] strong { color: var(--text) !important; font-weight: 700 !important; }
+        /* Captions ("Preview of what was scraped…", "Will be created at …") */
+        div[role="dialog"] [data-testid="stCaptionContainer"],
+        [data-testid="stDialog"] [data-testid="stCaptionContainer"] {
+            color: var(--text-soft) !important;
+        }
+        /* Code-style "downloads/<name>" snippets inside the dialog */
+        div[role="dialog"] code,
+        [data-testid="stDialog"] code {
+            background: var(--surface-3) !important;
+            color: var(--text) !important;
+        }
+        /* Inputs inside the dialog explicitly */
+        div[role="dialog"] input,
+        div[role="dialog"] textarea,
+        [data-testid="stDialog"] input,
+        [data-testid="stDialog"] textarea {
+            color: var(--text) !important;
+            -webkit-text-fill-color: var(--text) !important;
+            background: var(--surface) !important;
+        }
+        /* Dialog close (×) button */
+        div[role="dialog"] button[aria-label="Close"],
+        [data-testid="stDialog"] button[aria-label="Close"] {
+            color: var(--text) !important;
+            background: transparent !important;
+        }
+        /* Backdrop dim */
+        div[data-baseweb="modal-backdrop"],
+        [data-testid="stModalBackdrop"] {
+            background: rgba(15, 23, 42, 0.55) !important;
+        }
+
+        /* Re-assert hero text after the broad overrides above */
+        .es-hero h1 { color: #ffffff !important; }
+        .es-hero p { color: rgba(255, 255, 255, 0.7) !important; }
+        .es-hero .es-badge { color: #c4b5fd !important; }
         </style>
         """,
         unsafe_allow_html=True,
