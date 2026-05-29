@@ -116,10 +116,13 @@ class LeboncoinScraper(EbayScraper):
 
     LEBONCOIN_HOSTS = ("leboncoin.fr",)
 
-    def __init__(self):
+    def __init__(self, headless: bool = True):
         super().__init__()
         # French-leaning Accept-Language helps us get the FR listing variant.
         self.session.headers["Accept-Language"] = "fr-FR,fr;q=0.9,en;q=0.7"
+        # Headless by default; a visible window often clears DataDome more
+        # reliably (toggle from the sidebar).
+        self.headless = headless
         logger.info("Leboncoin scraper initialized")
 
     # ----- URL handling ----------------------------------------------------
@@ -379,10 +382,19 @@ class LeboncoinScraper(EbayScraper):
         """
         from playwright.sync_api import sync_playwright
 
+        # playwright-stealth patches dozens of automation fingerprints
+        # (webdriver, chrome runtime, plugins, WebGL vendor, etc.). Optional —
+        # we degrade gracefully to a manual webdriver patch if it's missing.
+        stealth_fn = None
+        try:
+            from playwright_stealth import stealth_sync as stealth_fn  # type: ignore
+        except Exception:
+            stealth_fn = None
+
         ua = random.choice(_eb.USER_AGENTS)
         with sync_playwright() as p:
             browser = p.chromium.launch(
-                headless=True,
+                headless=self.headless,
                 args=[
                     "--no-sandbox",
                     "--disable-blink-features=AutomationControlled",
@@ -401,6 +413,11 @@ class LeboncoinScraper(EbayScraper):
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
             )
             page = context.new_page()
+            if stealth_fn is not None:
+                try:
+                    stealth_fn(page)
+                except Exception as e:
+                    logger.debug(f"playwright-stealth could not be applied: {e}")
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=45000)
                 # Give DataDome a moment, then wait for the data island.
@@ -842,6 +859,23 @@ def main():
             st.success("Groq key set")
         else:
             st.info("Add key to enable AI features")
+
+        st.markdown('<div class="es-side-section">Scraping</div>', unsafe_allow_html=True)
+        show_browser = st.checkbox(
+            "Show browser window",
+            value=False,
+            help=(
+                "Leboncoin uses DataDome anti-bot. When a request is blocked, a "
+                "real browser is used to load the page. Running it visibly "
+                "(non-headless) clears the challenge more reliably. Requires "
+                "Playwright: `pip install playwright && playwright install chromium`."
+            ),
+            key="lbc_show_browser",
+        )
+        # Propagate the preference to the scraper (headless = not visible).
+        scraper.headless = not show_browser
+        if not _playwright_available():
+            st.caption("⚠️ Playwright not installed — browser fallback disabled.")
 
     tab1, tab2, tab3, tab_fmt, tab5 = st.tabs(NAV_OPTIONS)
 

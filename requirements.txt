@@ -10,3 +10,5 @@ tenacity>=8.2.3
 # Headless-browser fallback for Leboncoin (DataDome). After install, run once:
 #   playwright install chromium
 playwright>=1.40.0
+# Optional: extra anti-fingerprinting for the browser fallback.
+playwright-stealth>=1.0.6
