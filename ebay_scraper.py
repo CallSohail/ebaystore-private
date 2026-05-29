@@ -4525,6 +4525,10 @@ def main():
                                         "text": result_text,
                                         "platform": target_platform,
                                         "timestamp": datetime.now().strftime("%H:%M"),
+                                        # Unique per generation so the output
+                                        # text_area refreshes instead of showing
+                                        # the previous folder's result.
+                                        "key": f"{selected_folder_name}_{target_platform}_{datetime.now().strftime('%H%M%S%f')}",
                                     }
                                     out_name = f"{selected_folder_name}_{target_platform}_listing.txt"
                                     out_path = Path(folder_info["folder_path"]) / out_name
@@ -4537,7 +4541,17 @@ def main():
                     res = st.session_state.ai_generated_result
                     if res:
                         st.caption(f"Generated for **{res['platform']}** at {res['timestamp']}")
-                        st.text_area("Output", value=res['text'], height=420, key="ai_result_area")
+                        # NOTE: no static `key=` here. A keyed text_area keeps its
+                        # own value in session_state and ignores the `value=` arg on
+                        # reruns, which made the panel show the previous folder's
+                        # result after regenerating. Using a result-specific key
+                        # forces a fresh widget whenever a new description is made.
+                        st.text_area(
+                            "Output",
+                            value=res['text'],
+                            height=420,
+                            key=f"ai_result_area_{res.get('key', '')}",
+                        )
                         st.download_button(
                             "Download .txt",
                             data=res['text'],
