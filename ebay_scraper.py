@@ -159,8 +159,10 @@ class PlatformAgent:
                 "max_description_chars": 1500,
                 "required_fields": ["brand", "size", "condition", "color", "material", "category"],
                 "tone_rules": "Warm and casual. 1-3 light emojis allowed. Mention bundle discounts and fast shipping. Be transparent about flaws.",
-                "description_style": "Short intro about the item, bullet list of measurements/materials, honest condition note, closing line with bundling/shipping info. Add 5-10 relevant hashtags at the bottom (#brand #y2k #vintage).",
-                "must_avoid": ["counterfeit claims", "external links", "personal contact info", "price negotiation outside Vinted"]
+                "description_style": "Two sections only: a 'Specifications' bullet list and a 'Condition' bullet list. No intro paragraph, no marketing copy, no hashtags, no emojis.",
+                "must_avoid": ["counterfeit claims", "external links", "personal contact info", "price negotiation outside Vinted", "marketing fluff", "hashtags", "emojis", "intro/closing lines"],
+                # Vinted uses a strict two-section template (see _generate_strict_description).
+                "strict_format": True
             },
             "vestiaire collective": {
                 "name": "Vestiaire Collective",
@@ -318,7 +320,78 @@ class PlatformAgent:
             return self.platforms.get(aliases[target], self.platforms["general"])
         return self.platforms["general"]
     
-    def generate_platform_description(self, raw_text: str, product_data: Optional[Any], 
+    def _generate_strict_description(self, platform_info: Dict, raw_text: str, title: str,
+                                     brand: str, condition: str, specs: Dict,
+                                     custom_instructions: str = "") -> str:
+        """Generate a description for platforms that require a strict, fixed
+        two-section layout (Specifications + Condition) and nothing else.
+
+        Used for Vinted. The output deliberately omits titles, marketing
+        intros, closing lines, hashtags and emojis — only the two bullet
+        sections are produced, matching the seller's expected format.
+        """
+        name = platform_info.get('name', 'this platform')
+        extra = (
+            f"\nUSER CUSTOM INSTRUCTIONS (apply where they do not break the format): {custom_instructions}\n"
+            if custom_instructions else ""
+        )
+
+        prompt = f"""You are an expert second-hand fashion listing writer for {name}.
+
+Produce a listing using EXACTLY two sections and NOTHING else: "Specifications" and "Condition". Do not add a title line, an intro paragraph, marketing copy, a closing line, hashtags, or emojis.
+
+INPUT DATA:
+Title: {title}
+Brand: {brand}
+Condition: {condition}
+Specifications: {json.dumps(specs, ensure_ascii=False)}
+
+RAW TEXT (may contain noise like nav menus, similar-item lists, seller banners — extract only the real product information):
+{raw_text}
+{extra}
+OUTPUT FORMAT — copy this structure exactly (plain text, no markdown symbols like # or **):
+
+Specifications
+- Brand: <value>
+- Category: <value>
+- Material: <value>
+- Color: <value>
+- Size: <value, include cm and inches when available>
+- <add only the spec lines the source supports, e.g. Strap Drop, Handle Drop, Dimensions, Product Line, Serial No., Country of Manufacture, Hardware>
+
+Condition (<overall grade, e.g. Pre-owned – Good>)
+- Exterior: <value>
+- <add only the condition lines the source supports, e.g. Handle, Shoulder Strap, Metal fittings, Interior, Pocket, Corners, Odor>
+
+HARD RULES:
+1. Output ONLY the two sections above — no title, no description paragraph, no hashtags, no emojis, no marketing language, no shipping/bundle lines.
+2. Use the exact section headers "Specifications" and "Condition (<grade>)".
+3. Use bullet lines in the form "- Label: value".
+4. Only include lines that the source actually supports. NEVER invent specs, measurements, materials, serial numbers, or condition flaws.
+5. Keep every concrete number and code from the source (cm, inches, serial numbers, product line codes).
+6. In the Condition header, state the overall condition grade in parentheses when it is known.
+7. Be honest and specific about flaws, using the source's wording.
+
+Begin now with the line "Specifications".
+"""
+
+        cache_key = f"{name}_strict_{title}_{hash(raw_text[:500])}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            logger.debug("Using cached strict-format description")
+            return cached
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+            max_tokens=1500
+        )
+        result_text = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
+        self.cache.set(cache_key, result_text)
+        return result_text
+
+    def generate_platform_description(self, raw_text: str, product_data: Optional[Any],
                                      platform: str, custom_instructions: str = "") -> str:
         """
         Generate clean, platform-optimized product description.
@@ -347,6 +420,14 @@ class PlatformAgent:
                 condition = getattr(product_data, 'condition', '')
                 specs = getattr(product_data, 'item_specifics', {})
             
+            # Platforms with a strict, fixed-structure template (e.g. Vinted)
+            # bypass the generic listing prompt and use a dedicated builder that
+            # emits ONLY the required sections.
+            if platform_info.get('strict_format'):
+                return self._generate_strict_description(
+                    platform_info, raw_text, title, brand, condition, specs, custom_instructions
+                )
+
             required_fields = platform_info.get('required_fields', [])
             tone_rules = platform_info.get('tone_rules', '')
             must_avoid = platform_info.get('must_avoid', [])
@@ -3469,6 +3550,116 @@ def inject_global_styles() -> None:
             border-color: var(--accent) !important;
             background: rgba(99, 102, 241, 0.03) !important;
         }
+
+        /* =====================================================================
+           THEME ROBUSTNESS
+           This app ships a single, polished light theme. The block below makes
+           sure it stays readable even when Streamlit is switched to its built-in
+           Dark theme (Settings -> Appearance). It pins every surface and text
+           colour explicitly so nothing renders dark-text-on-dark or
+           white-text-on-white in any state.
+           ===================================================================== */
+        :root { color-scheme: light !important; }
+        html, body, .stApp { color-scheme: light !important; }
+
+        /* Force the app canvas + main containers to the light palette */
+        .stApp, .main, .block-container,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"],
+        [data-testid="stHeader"] {
+            background: var(--bg) !important;
+            color: var(--text) !important;
+        }
+
+        /* Generic readable text (paragraphs, lists, captions, markdown) */
+        .stApp p, .stApp li, .stApp label,
+        .stMarkdown, .stMarkdown p, .stMarkdown li,
+        [data-testid="stMarkdownContainer"] p,
+        [data-testid="stMarkdownContainer"] li,
+        [data-testid="stCaptionContainer"],
+        [data-testid="stWidgetLabel"] p,
+        [data-testid="stWidgetLabel"] label {
+            color: var(--text) !important;
+        }
+
+        /* Selectbox / multiselect: the closed control + its displayed value */
+        .stSelectbox [data-baseweb="select"] div,
+        .stSelectbox [data-baseweb="select"] span,
+        .stSelectbox [data-baseweb="select"] input,
+        .stMultiSelect [data-baseweb="select"] div,
+        .stMultiSelect [data-baseweb="select"] span {
+            color: var(--text) !important;
+            -webkit-text-fill-color: var(--text) !important;
+        }
+        .stSelectbox [data-baseweb="select"] svg,
+        .stMultiSelect [data-baseweb="select"] svg {
+            fill: var(--text-soft) !important;
+        }
+
+        /* Dropdown menu/options. These render in a body-level portal, so the
+           selectors are intentionally global (not scoped under .stApp). */
+        div[data-baseweb="popover"],
+        div[data-baseweb="popover"] > div,
+        div[data-baseweb="popover"] [data-baseweb="menu"],
+        [data-baseweb="menu"],
+        ul[data-baseweb="menu"],
+        ul[role="listbox"],
+        [data-testid="stSelectboxVirtualDropdown"],
+        [data-testid="stVirtualDropdown"] {
+            background: var(--surface) !important;
+            color: var(--text) !important;
+        }
+        [data-baseweb="menu"] li,
+        ul[role="listbox"] li,
+        [role="option"],
+        [data-testid="stSelectboxVirtualDropdown"] li {
+            background: var(--surface) !important;
+            color: var(--text) !important;
+        }
+        [data-baseweb="menu"] li *,
+        [role="option"] * {
+            color: var(--text) !important;
+        }
+        [data-baseweb="menu"] li:hover,
+        [role="option"]:hover,
+        [data-baseweb="menu"] li[aria-selected="true"],
+        [role="option"][aria-selected="true"] {
+            background: var(--surface-3) !important;
+            color: var(--text) !important;
+        }
+
+        /* Inputs + text areas: keep the typed/shown text dark on light */
+        .stTextInput input, .stNumberInput input, .stTextArea textarea,
+        .stDateInput input,
+        [data-baseweb="input"] input, [data-baseweb="base-input"] input,
+        [data-baseweb="textarea"] textarea {
+            color: var(--text) !important;
+            -webkit-text-fill-color: var(--text) !important;
+            background: var(--surface) !important;
+        }
+
+        /* Radios / checkboxes labels */
+        .stRadio label, .stCheckbox label,
+        [data-testid="stWidgetLabel"] { color: var(--text) !important; }
+
+        /* Expander body + tab panels keep light surfaces */
+        details[data-testid="stExpander"] div,
+        .stTabs [data-baseweb="tab-panel"] { color: var(--text) !important; }
+
+        /* Help tooltips stay dark bubble + white text in either theme */
+        div[data-baseweb="tooltip"], div[data-baseweb="tooltip"] * {
+            background: #0f172a !important;
+            color: #ffffff !important;
+        }
+
+        /* Keep alert text readable on their light tinted backgrounds */
+        .stAlert, .stAlert p, .stAlert div, .stAlert span { color: var(--text) !important; }
+
+        /* Re-assert hero (dark gradient) text after the broad overrides above */
+        .es-hero h1, .es-hero p, .es-hero .es-badge { color: inherit; }
+        .es-hero h1 { color: #ffffff !important; }
+        .es-hero p { color: rgba(255, 255, 255, 0.7) !important; }
+        .es-hero .es-badge { color: #c4b5fd !important; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -3876,7 +4067,15 @@ def main():
                     # Smart Selection Logic
                     folder_names = [f["folder_name"] for f in product_folders]
                     selected_folder_name = st.selectbox("Product Folder", folder_names)
-                    
+
+                    # When the user switches to a different folder, clear the
+                    # previously generated description so the result panel starts
+                    # fresh for the new folder. (The old result is already saved
+                    # to its folder on disk, so nothing is lost.)
+                    if st.session_state.get("ai_last_folder") != selected_folder_name:
+                        st.session_state.ai_generated_result = None
+                        st.session_state.ai_last_folder = selected_folder_name
+
                     folder_info = next((f for f in product_folders if f["folder_name"] == selected_folder_name), None)
                     
                     selected_file = None
