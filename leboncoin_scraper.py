@@ -33,6 +33,7 @@ import re
 import time
 import random
 import traceback
+import concurrent.futures
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse
@@ -77,6 +78,27 @@ _folder_name_dialog = _eb._folder_name_dialog
 BASE_SAVE_DIR = _eb.BASE_SAVE_DIR
 
 LEBONCOIN_CSV = "Leboncoin_Products.csv"
+
+# Leboncoin sits behind DataDome, which 403s plain HTTP requests. When that
+# happens we fall back to a real headless browser (Playwright) that executes
+# the JS challenge and collects a valid cookie.
+BROWSER_INSTALL_MSG = (
+    "Leboncoin blocked the request (DataDome) and the headless-browser "
+    "fallback is not available.\n\n"
+    "To enable it, install Playwright + a browser once:\n"
+    "    pip install playwright\n"
+    "    playwright install chromium\n\n"
+    "Then try again. (A residential / home internet connection also helps — "
+    "datacenter IPs are blocked aggressively.)"
+)
+
+
+def _playwright_available() -> bool:
+    try:
+        import playwright  # noqa: F401
+        return True
+    except Exception:
+        return False
 
 
 # =============================================================================
@@ -348,6 +370,90 @@ class LeboncoinScraper(EbayScraper):
             item_id=self.extract_id_from_url(url) or "",
         ), ([image] if image else [])
 
+    # ----- fetching (HTTP first, headless browser fallback) ----------------
+    def _browser_worker(self, url: str):
+        """Render ``url`` in headless Chromium; return (html, cookies).
+
+        Runs in its own thread (see ``_fetch_with_browser``) so Playwright's
+        sync API never collides with an asyncio loop Streamlit may be running.
+        """
+        from playwright.sync_api import sync_playwright
+
+        ua = random.choice(_eb.USER_AGENTS)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            context = browser.new_context(
+                user_agent=ua,
+                locale="fr-FR",
+                timezone_id="Europe/Paris",
+                viewport={"width": 1366, "height": 900},
+                extra_http_headers={"Accept-Language": "fr-FR,fr;q=0.9,en;q=0.7"},
+            )
+            # Hide the obvious navigator.webdriver automation flag.
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+            page = context.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                # Give DataDome a moment, then wait for the data island.
+                try:
+                    page.wait_for_selector("script#__NEXT_DATA__", timeout=15000)
+                except Exception:
+                    page.wait_for_timeout(3500)
+                html = page.content()
+                cookies = context.cookies()
+                return html, cookies
+            finally:
+                context.close()
+                browser.close()
+
+    def _fetch_with_browser(self, url: str):
+        """Run the browser worker in an isolated thread. Returns (html, cookies)."""
+        if not _playwright_available():
+            return None, None
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                return ex.submit(self._browser_worker, url).result(timeout=75)
+        except Exception as e:
+            logger.warning(f"Headless-browser fetch failed: {e}")
+            return None, None
+
+    def _get_page(self, url: str, referer: str) -> Optional[str]:
+        """Return rendered HTML for ``url``.
+
+        Tries a fast HTTP request first; on a block/anti-bot response, falls
+        back to a headless browser and copies its cookies onto the session so
+        image downloads (img.leboncoin.fr) stay authenticated.
+        """
+        response = safe_request(self.session, url, timeout=30, referer=referer)
+        if response is not None and response.status_code == 200:
+            text = response.text
+            low = text.lower()
+            blocked = ("datadome" in low or "captcha" in low or "are you a human" in low)
+            if "__NEXT_DATA__" in text or not blocked:
+                return text
+
+        # HTTP failed or was challenged — try a real browser.
+        html, cookies = self._fetch_with_browser(url)
+        if html:
+            for c in cookies or []:
+                try:
+                    self.session.cookies.set(
+                        c.get("name"), c.get("value"), domain=c.get("domain")
+                    )
+                except Exception:
+                    pass
+            return html
+        return None
+
     def scrape_product(self, url: str) -> ScrapingResult:
         """Scrape a single Leboncoin listing into a :class:`ScrapingResult`."""
         try:
@@ -363,33 +469,29 @@ class LeboncoinScraper(EbayScraper):
 
             time.sleep(random.uniform(0.8, 2.0))
 
-            response = safe_request(self.session, url, timeout=30, referer=referer)
-            if not response:
+            html = self._get_page(url, referer)
+            if not html:
+                if not _playwright_available():
+                    return ScrapingResult(success=False, error_message=BROWSER_INSTALL_MSG)
                 return ScrapingResult(
                     success=False,
                     error_message=(
-                        "Could not load the listing. Likely reasons:\n"
-                        "• Leboncoin's anti-bot layer (DataDome) blocked this IP — "
-                        "wait a few minutes and retry, or run from a residential connection.\n"
-                        "• The ad was sold, expired or removed.\n"
-                        "• You are behind a corporate/university proxy.\n"
-                        "• The URL is mis-typed (check the ad id)."
+                        "Could not load the listing even via the headless browser.\n"
+                        "• DataDome may be serving a hard challenge for this IP — "
+                        "wait a few minutes, or use a residential connection.\n"
+                        "• The ad may have been sold, expired or removed."
                     ),
                 )
 
-            if response.status_code == 404:
+            soup = BeautifulSoup(html, "html.parser")
+
+            lowered = html.lower()
+            if ("__NEXT_DATA__" not in html) and (
+                "datadome" in lowered or "captcha" in lowered or "are you a human" in lowered
+            ):
                 return ScrapingResult(
                     success=False,
-                    error_message="This Leboncoin ad was not found. It may have expired or been removed.",
-                )
-
-            soup = BeautifulSoup(response.content, "html.parser")
-
-            lowered = response.text.lower()
-            if "datadome" in lowered or "captcha" in lowered or "are you a human" in lowered:
-                return ScrapingResult(
-                    success=False,
-                    error_message="Leboncoin is requesting bot verification (DataDome). Wait a few minutes and try again.",
+                    error_message="Leboncoin is showing a bot-verification (DataDome) challenge. Wait a few minutes and try again.",
                 )
 
             ad = self._extract_ad_json(soup)
