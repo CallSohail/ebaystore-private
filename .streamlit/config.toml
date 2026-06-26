@@ -1,0 +1,28 @@
+# Streamlit runtime configuration.
+#
+# This fixes the "blank white page" that appears when the app is opened over a
+# LAN IP (e.g. http://192.168.x.x:8501) on a locked-down network: Streamlit
+# tries to fetch a usage-stats/metrics config from the internet on session
+# start, and if that request is blocked the frontend can fail to initialize and
+# render nothing. Disabling telemetry removes that request entirely. The CORS /
+# XSRF settings make remote (non-localhost) access reliable.
+
+[browser]
+# Do not phone home for usage statistics — this is the request that fails on
+# restricted networks and can blank the page.
+gatherUsageStats = false
+
+[server]
+# Listen on all interfaces so phones / other machines on the LAN can connect.
+address = "0.0.0.0"
+# Don't try to auto-open a local browser on the server.
+headless = true
+# Allow cross-origin / IP access without the XSRF handshake that can block
+# the websocket when the app is reached via a bare IP address.
+enableCORS = false
+enableXsrfProtection = false
+
+[theme]
+# Pin a light theme so the page never depends on the browser/OS dark-mode
+# preference (the app's custom CSS is designed for a light background).
+base = "light"
