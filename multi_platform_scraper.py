@@ -30,6 +30,7 @@ import os
 import re
 import csv
 import json
+import sys
 import time
 import random
 import logging
@@ -42,6 +43,11 @@ from urllib.parse import urlparse, urljoin, parse_qs
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup, Tag
+
+# Newer Streamlit versions log a deprecation warning for every `use_container_width`
+# call. We support older Streamlit (1.32) too, so we keep the parameter and just
+# quiet the warning to avoid flooding the console with harmless noise.
+logging.getLogger("streamlit").setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------------
 # Re-use the battle-tested infrastructure already implemented for eBay so the
@@ -198,13 +204,18 @@ class BaseScraper:
 
     # --------------------------------------------------------------- fetching
     @staticmethod
+    def playwright_status() -> Tuple[bool, str]:
+        """Return (importable, error_detail) for the Playwright engine."""
+        try:
+            from playwright.sync_api import sync_playwright  # noqa: F401
+            return True, ""
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
+    @staticmethod
     def playwright_available() -> bool:
         """True if Playwright (the headless-browser engine) is importable."""
-        try:
-            import playwright  # noqa: F401
-            return True
-        except Exception:
-            return False
+        return BaseScraper.playwright_status()[0]
 
     def _fetch_rendered(self, url: str) -> Tuple[Optional[str], Optional[str]]:
         """
@@ -1143,15 +1154,31 @@ def render_scrape_tab(file_manager: FileManager):
     st.caption(f"Example {platform} URL:  `{scraper_cls.EXAMPLE_URL}`")
 
     # Browser-engine status — these sites need a real browser to render.
-    if BaseScraper.playwright_available():
+    pw_ok, pw_err = BaseScraper.playwright_status()
+    if pw_ok:
         st.caption("🟢 Browser engine ready (Playwright) — JavaScript pages will render fully.")
     else:
+        py = sys.executable or "python"
         st.warning(
-            "🔴 **Playwright is not installed.** Temu / Alibaba / AliExpress / Shein build "
-            "their pages with JavaScript, so a real browser engine is required to read them. "
-            "Install it once, then restart the app:\n\n"
-            "```\npip install playwright\nplaywright install chromium\n```"
+            "🔴 **The browser engine isn't available to *this* app.** Temu / Alibaba / "
+            "AliExpress / Shein build their pages with JavaScript, so Playwright is needed "
+            "for full results. (AliExpress often still works without it.)"
         )
+        with st.expander("🔧 Fix it — install into the exact Python this app uses", expanded=True):
+            st.markdown(
+                "The most common cause is that `streamlit run` uses a **different Python** "
+                "than the `pip` you ran. Install into *this* app's interpreter and launch "
+                "with the same one — copy these three lines:"
+            )
+            st.code(
+                f'"{py}" -m pip install playwright\n'
+                f'"{py}" -m playwright install chromium\n'
+                f'"{py}" -m streamlit run multi_platform_scraper.py',
+                language="powershell",
+            )
+            st.caption(f"This app is running on: `{py}`")
+            if pw_err:
+                st.caption(f"Import error: `{pw_err}`")
 
     if go:
         handle_scrape(url, platform, file_manager)
