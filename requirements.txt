@@ -7,3 +7,6 @@ groq>=0.4.2
 rembg>=2.0.50
 openpyxl>=3.1.2
 tenacity>=8.2.3
+# Headless-browser engine required to scrape JavaScript-rendered marketplaces
+# (Temu, Alibaba, AliExpress, Shein). After installing, run:  playwright install chromium
+playwright>=1.40.0

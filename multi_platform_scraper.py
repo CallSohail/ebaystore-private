@@ -100,6 +100,16 @@ class BaseScraper:
     IMAGE_HOSTS: Tuple[str, ...] = ()
     ID_PATTERNS: Tuple[str, ...] = ()
     EXAMPLE_URL: str = ""
+    # Substrings that mark a URL as a *product* page (not homepage/search/cart).
+    PRODUCT_URL_HINTS: Tuple[str, ...] = ()
+    # Only keep images whose URL contains one of these path fragments (when set).
+    # This is the single most effective filter for dropping logos / UI icons that
+    # live on the same CDN as the real product photos.
+    IMAGE_PATH_HINTS: Tuple[str, ...] = ()
+    # CSS selectors for the product image gallery, tried first (highest signal).
+    GALLERY_SELECTORS: Tuple[str, ...] = ()
+    # A selector Playwright waits for so we know the product actually rendered.
+    WAIT_SELECTOR: str = "h1"
     # Currency tokens used when sniffing prices out of free text / JSON.
     CURRENCY_TOKENS = ("$", "£", "€", "¥", "₹", "US $", "USD", "EUR", "GBP", "AED", "PKR")
 
@@ -144,6 +154,22 @@ class BaseScraper:
                 f"URL must be from {self.DISPLAY_NAME} "
                 f"(expected one of: {', '.join(self.DOMAINS)})"
             )
+
+        # Reject homepage / search / category / ad-redirect links. A real product
+        # page either matches a product-id pattern or contains a product hint.
+        path_q = ((parsed.path or "") + "?" + (parsed.query or "")).lower()
+        has_hint = (
+            bool(self.extract_item_id(url))
+            or any(h in path_q for h in self.PRODUCT_URL_HINTS)
+        )
+        if not has_hint:
+            raise ValidationError(
+                f"This doesn't look like a {self.DISPLAY_NAME} *product* page "
+                "(it may be a homepage, search, category or ad-redirect link). "
+                "Open the product itself and copy the full URL from your browser's "
+                f"address bar — it should contain the product id, e.g. "
+                f"{self.EXAMPLE_URL}"
+            )
         return True
 
     def extract_item_id(self, url: str) -> str:
@@ -171,68 +197,192 @@ class BaseScraper:
         return ""
 
     # --------------------------------------------------------------- fetching
+    @staticmethod
+    def playwright_available() -> bool:
+        """True if Playwright (the headless-browser engine) is importable."""
+        try:
+            import playwright  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def _fetch_rendered(self, url: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Render the page in a real headless Chromium via Playwright and return
+        (html, final_url). This is essential for Temu / Alibaba / AliExpress /
+        Shein, which build their pages with JavaScript. Returns (None, None)
+        when Playwright is not installed or the render fails.
+        """
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception:
+            return None, None
+
+        launch_args = [
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+        ]
+
+        try:
+            with sync_playwright() as pw:
+                try:
+                    browser = pw.chromium.launch(headless=True, args=launch_args)
+                except Exception as launch_exc:
+                    # The matching browser build may be missing (e.g. "playwright
+                    # install" not run, or a revision mismatch). Fall back to any
+                    # Chromium/Chrome we can find on disk before giving up.
+                    exe = self._find_chromium_executable()
+                    if not exe:
+                        logger.warning(
+                            "Playwright browser not found (%s). Run "
+                            "'playwright install chromium'.", launch_exc,
+                        )
+                        return None, None
+                    browser = pw.chromium.launch(
+                        headless=True, args=launch_args, executable_path=exe
+                    )
+                context = browser.new_context(
+                    user_agent=REQUEST_HEADERS["User-Agent"],
+                    locale="en-US",
+                    viewport={"width": 1366, "height": 900},
+                    extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+                )
+                # Light stealth: hide the webdriver flag many anti-bots look for.
+                context.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                )
+                page = context.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                # Give the SPA a chance to paint the product.
+                try:
+                    page.wait_for_selector(self.WAIT_SELECTOR, timeout=10000)
+                except Exception:
+                    pass
+                # Scroll to trigger lazy-loaded gallery images.
+                for _ in range(5):
+                    page.mouse.wheel(0, 2500)
+                    page.wait_for_timeout(600)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+                html = page.content()
+                final_url = page.url
+                context.close()
+                browser.close()
+                return html, final_url
+        except Exception as exc:
+            logger.warning("Playwright render failed for %s: %s", self.DISPLAY_NAME, exc)
+            return None, None
+
+    @staticmethod
+    def _find_chromium_executable() -> Optional[str]:
+        """Locate a Chromium/Chrome binary when Playwright's own build is absent."""
+        import glob
+        import shutil
+
+        candidates: List[str] = []
+        base = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+        if base:
+            candidates += glob.glob(os.path.join(base, "chromium-*/chrome-linux/chrome"))
+            candidates += glob.glob(os.path.join(base, "chromium-*/chrome-win/chrome.exe"))
+            candidates += glob.glob(os.path.join(
+                base, "chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium"))
+        for name in ("chromium", "chromium-browser", "google-chrome",
+                     "google-chrome-stable", "chrome"):
+            found = shutil.which(name)
+            if found:
+                candidates.append(found)
+        # Common Windows install locations.
+        for path in (
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ):
+            candidates.append(path)
+        for exe in candidates:
+            if exe and os.path.exists(exe):
+                return exe
+        return None
+
     def scrape_product(self, url: str) -> ScrapingResult:
-        """Main entry point: validate, fetch, parse and return a result."""
+        """Main entry point: validate, fetch (browser-first), parse and return."""
         try:
             self.validate_url(url)
             url = url.strip().strip("<>\"'")
             if not re.match(r"^[a-zA-Z]+://", url):
                 url = "https://" + url
 
-            # Light anti-bot jitter.
-            time.sleep(random.uniform(0.4, 1.4))
+            time.sleep(random.uniform(0.3, 1.0))
 
-            response = safe_request(self.session, url, timeout=30)
-            if not response:
-                return ScrapingResult(
-                    success=False,
-                    error_message=(
-                        f"Could not connect to {self.DISPLAY_NAME}. Please check:\n"
-                        "• Your internet connection is stable\n"
-                        "• The product listing still exists\n"
-                        "• Wait 1-2 minutes if you've made many requests"
-                    ),
-                )
+            # 1) Preferred path: render with a real browser so JS-built product
+            #    content actually exists in the HTML we parse.
+            html, final_url = self._fetch_rendered(url)
+            used_browser = html is not None
 
-            if response.status_code == 404:
-                return ScrapingResult(
-                    success=False,
-                    error_message=f"This {self.DISPLAY_NAME} listing was not found (404).",
-                )
+            # 2) Fallback: plain HTTP (works only for pages that ship structured
+            #    data server-side; kept so the tool still does *something* without
+            #    Playwright installed).
+            if html is None:
+                response = safe_request(self.session, url, timeout=30)
+                if not response:
+                    return ScrapingResult(
+                        success=False,
+                        error_message=(
+                            f"Could not load this {self.DISPLAY_NAME} page.\n\n"
+                            + self._playwright_hint()
+                        ),
+                    )
+                if response.status_code == 404:
+                    return ScrapingResult(
+                        success=False,
+                        error_message=f"This {self.DISPLAY_NAME} listing was not found (404).",
+                    )
+                html = response.text
+                final_url = response.url
 
-            html = response.text
-            soup = BeautifulSoup(response.content, "html.parser")
-
+            soup = BeautifulSoup(html, "html.parser")
             page_text = soup.get_text(" ", strip=True).lower()
-            if "captcha" in page_text or "verify you are a human" in page_text or "px-captcha" in html.lower():
+            low_html = html.lower()
+            if (
+                "px-captcha" in low_html
+                or "/_sec/cp_challenge" in low_html
+                or "verify you are a human" in page_text
+                or "are you a robot" in page_text
+                or "access denied" in page_text[:2000]
+            ):
                 return ScrapingResult(
                     success=False,
                     error_message=(
-                        f"{self.DISPLAY_NAME} is requesting human verification (anti-bot). "
-                        "These marketplaces render content with JavaScript and aggressively "
-                        "block automated requests. Try again in a few minutes, or open the "
-                        "page in a browser and retry."
+                        f"{self.DISPLAY_NAME} blocked this request with anti-bot "
+                        "verification. Wait a minute and retry; opening the product "
+                        "once in a normal browser first can also help."
                     ),
                 )
 
-            product = self.extract_product_data(soup, html, url)
-            images = self.get_product_images(soup, html, url)
+            product = self.extract_product_data(soup, html, final_url or url)
+            images = self.get_product_images(soup, html, final_url or url)
             product.item_specifics.setdefault("Source Platform", self.DISPLAY_NAME)
 
             if not product.title:
+                hint = "" if used_browser else "\n\n" + self._playwright_hint()
+                extra = (
+                    " The page rendered but exposed no product data — it may be a "
+                    "login wall, a region/redirect page, or behind anti-bot."
+                    if used_browser else ""
+                )
                 return ScrapingResult(
                     success=False,
                     error_message=(
-                        f"Could not extract a product title from {self.DISPLAY_NAME}. "
-                        "The page likely loaded its content with JavaScript, which a simple "
-                        "HTTP scraper cannot execute. Structured data may still be missing."
+                        f"Could not extract a product title from {self.DISPLAY_NAME}."
+                        + extra + hint
                     ),
                 )
 
             return ScrapingResult(success=True, product_data=product, image_urls=images)
 
         except ValidationError as exc:
-            return ScrapingResult(success=False, error_message=f"Invalid URL: {exc}")
+            return ScrapingResult(success=False, error_message=f"{exc}")
         except NetworkError as exc:
             return ScrapingResult(success=False, error_message=f"Network error: {exc}")
         except DataExtractionError as exc:
@@ -243,6 +393,15 @@ class BaseScraper:
                 success=False,
                 error_message="An unexpected error occurred. Please try again.",
             )
+
+    @staticmethod
+    def _playwright_hint() -> str:
+        return (
+            "These marketplaces build their pages with JavaScript, so the headless "
+            "browser engine **Playwright** is required. Install it once:\n\n"
+            "```\npip install playwright\nplaywright install chromium\n```\n\n"
+            "Then restart the app and try again."
+        )
 
     # ------------------------------------------------------- data extraction
     def extract_product_data(self, soup: BeautifulSoup, html: str, url: str) -> ProductData:
@@ -326,25 +485,55 @@ class BaseScraper:
             raise DataExtractionError(str(exc))
 
     # ----------------------------------------------------------------- images
-    def get_product_images(self, soup: BeautifulSoup, html: str, url: str) -> List[str]:
-        """Discover product image URLs from structured data, meta tags and JSON."""
+    def get_product_images(self, soup: BeautifulSoup, html: str, url: str,
+                           max_images: int = 30) -> List[str]:
+        """
+        Discover *product* image URLs only.
+
+        Priority order, each more reliable than the next as a signal that the
+        image actually belongs to the product (not site chrome):
+            1. The product image gallery (per-platform selectors)
+            2. JSON-LD `image`
+            3. OpenGraph / twitter image
+            4. Embedded JSON / raw HTML matching the product CDN + path hints
+            5. <img> tags (last resort, same strict filtering applies)
+
+        Every candidate must pass `_is_valid_image`, which drops logos, icons,
+        sprites, payment badges and anything off the product CDN. Results are
+        de-duplicated by image identity (ignoring resize suffixes).
+        """
         images: List[str] = []
-        seen = set()
+        seen_keys = set()
 
         def add(candidate: Optional[str]) -> None:
             if not candidate:
                 return
-            candidate = candidate.strip().replace("\\/", "/")
+            candidate = candidate.strip().replace("\\/", "/").replace("\\u002F", "/")
             if candidate.startswith("//"):
                 candidate = "https:" + candidate
             elif candidate.startswith("/"):
                 candidate = urljoin(url, candidate)
             candidate = self.get_high_res_image_url(candidate)
-            if candidate not in seen and self._is_valid_image(candidate):
-                seen.add(candidate)
-                images.append(candidate)
+            if not self._is_valid_image(candidate):
+                return
+            key = self._image_key(candidate)
+            if key in seen_keys:
+                return
+            seen_keys.add(key)
+            images.append(candidate)
 
-        # 1) JSON-LD images
+        # 1) Gallery DOM (strongest product signal)
+        for selector in self.GALLERY_SELECTORS:
+            for container in soup.select(selector):
+                for img in container.select("img"):
+                    for attr in ("src", "data-src", "data-lazy-src", "data-zoom-src", "data-image"):
+                        if img.get(attr):
+                            add(img.get(attr))
+                    srcset = img.get("srcset")
+                    if srcset:
+                        add(srcset.split(",")[-1].strip().split(" ")[0])
+
+        # 2) JSON-LD images
         ld = self._collect_jsonld_products(soup)
         ld_images = ld.get("image")
         if isinstance(ld_images, str):
@@ -353,21 +542,31 @@ class BaseScraper:
             for img in ld_images:
                 add(img if isinstance(img, str) else (img.get("url") if isinstance(img, dict) else None))
 
-        # 2) OpenGraph / twitter images
+        # 3) OpenGraph / twitter images
         for meta in soup.select('meta[property="og:image"], meta[property="og:image:secure_url"], meta[name="twitter:image"]'):
             add(meta.get("content"))
 
-        # 3) Embedded JSON / raw HTML — pull anything from the platform CDN hosts.
+        # 4) Embedded JSON / raw HTML — product CDN hosts (+ path hints) only.
         for found in self._regex_images_from_text(html):
             add(found)
 
-        # 4) <img> tags (last resort).
+        # 5) <img> tags (last resort, still strictly filtered).
         if not images:
             for img in soup.select("img"):
                 add(img.get("src") or img.get("data-src") or img.get("data-lazy-src"))
 
-        logger.info("Found %d images on %s", len(images), self.DISPLAY_NAME)
+        images = images[:max_images]
+        logger.info("Found %d product images on %s", len(images), self.DISPLAY_NAME)
         return images
+
+    @staticmethod
+    def _image_key(url: str) -> str:
+        """Identity of an image ignoring host and resize suffixes, for dedup."""
+        path = urlparse(url).path.lower()
+        stem = path.rsplit("/", 1)[-1]
+        stem = re.sub(r"_\d{2,4}x\d{2,4}.*", "", stem)
+        stem = re.sub(r"\.(jpg|jpeg|png|webp)$", "", stem)
+        return stem or url.lower()
 
     def _regex_images_from_text(self, html: str) -> List[str]:
         """Find image URLs hosted on this platform's CDN inside raw text/JSON."""
@@ -389,15 +588,31 @@ class BaseScraper:
 
     def _is_valid_image(self, url: str) -> bool:
         low = url.lower()
+        if low.startswith("data:"):
+            return False
         if not any(ext in low for ext in (".jpg", ".jpeg", ".png", ".webp")):
             return False
-        bad = ("sprite", "logo", "icon", "placeholder", "blank", "loading", "avatar",
-               "/1x1", "pixel", "favicon", "_50x50", "_60x60", "_80x80")
+        if ".svg" in low or ".gif" in low:
+            return False
+        # Generic non-product assets that show up across these sites.
+        bad = (
+            "sprite", "logo", "icon", "placeholder", "blank", "loading", "avatar",
+            "/1x1", "pixel", "favicon", "banner", "payment", "visa", "mastercard",
+            "paypal", "appstore", "app-store", "google-play", "googleplay", "qrcode",
+            "qr_code", "/qr", "download", "flag_", "/flags/", "coin", "/cms/", "/ui/",
+            "watermark", "thumbnail_220", "_50x50", "_60x60", "_80x80", "_90x90",
+            "_100x100", "_.gif", "rating", "star",
+        )
         if any(b in low for b in bad):
             return False
+        # Must be on the platform's product image CDN (drops third-party chrome).
         if self.IMAGE_HOSTS and not any(h in low for h in self.IMAGE_HOSTS):
-            # Allow generic CDN images only as a fallback when nothing matched.
-            return True
+            return False
+        # When a product-path hint is configured, require it — this is what
+        # separates real product photos from same-CDN UI icons (e.g. AliExpress
+        # product images live under /kf/).
+        if self.IMAGE_PATH_HINTS and not any(h in low for h in self.IMAGE_PATH_HINTS):
+            return False
         return True
 
     def get_high_res_image_url(self, img_url: str) -> str:
@@ -601,6 +816,10 @@ class TemuScraper(BaseScraper):
     DOMAINS = ("temu.com",)
     IMAGE_HOSTS = ("img.kwcdn.com", "aimg.kwcdn.com", "kwcdn.com")
     ID_PATTERNS = (r"-g-(\d+)\.html", r"goods_id=(\d+)", r"_g_(\d+)")
+    PRODUCT_URL_HINTS = ("-g-", "/goods", "goods_id=")
+    IMAGE_PATH_HINTS = ()  # product photos live across kwcdn paths; host filter is enough
+    GALLERY_SELECTORS = ('[class*="gallery" i]', '[class*="Gallery" i]', '[class*="swiper" i]', "main")
+    WAIT_SELECTOR = 'h1, [class*="goods" i], [class*="title" i]'
     EXAMPLE_URL = "https://www.temu.com/product-name-g-601099512123456.html"
 
     def _platform_seller(self, soup: BeautifulSoup, html: str) -> str:
@@ -615,6 +834,11 @@ class AlibabaScraper(BaseScraper):
     DOMAINS = ("alibaba.com",)
     IMAGE_HOSTS = ("alicdn.com", "sc04.alicdn.com", "s.alicdn.com", "cbu01.alicdn.com")
     ID_PATTERNS = (r"/product-detail/[^/]*?_?(\d{6,})\.html", r"/(\d{6,})\.html", r"productId=(\d+)")
+    PRODUCT_URL_HINTS = ("/product-detail/", "productid=")
+    IMAGE_PATH_HINTS = ()  # /imgextra/ covers products; host + excludes handle chrome
+    GALLERY_SELECTORS = ('[class*="gallery" i]', '[class*="image" i][class*="module" i]',
+                         '[class*="thumb" i]', '[class*="main-image" i]')
+    WAIT_SELECTOR = 'h1, [class*="product-title" i], [class*="title" i]'
     EXAMPLE_URL = "https://www.alibaba.com/product-detail/Product-Name_1600123456789.html"
 
     def _platform_seller(self, soup: BeautifulSoup, html: str) -> str:
@@ -629,6 +853,13 @@ class AliExpressScraper(BaseScraper):
     DOMAINS = ("aliexpress.com", "aliexpress.us", "aliexpress.ru")
     IMAGE_HOSTS = ("alicdn.com", "ae01.alicdn.com", "ae04.alicdn.com")
     ID_PATTERNS = (r"/item/(?:[^/]*?/)?(\d+)\.html", r"/i/(\d+)\.html", r"productId=(\d+)")
+    PRODUCT_URL_HINTS = ("/item/", "/i/")
+    # AliExpress product photos live under /kf/ — this single hint removes the
+    # site logo, payment icons and other same-CDN chrome.
+    IMAGE_PATH_HINTS = ("/kf/",)
+    GALLERY_SELECTORS = ('[class*="gallery" i]', '[class*="slider--img" i]',
+                         '[class*="image-view" i]', '[class*="magnifier" i]')
+    WAIT_SELECTOR = 'h1, [class*="title--wrap" i], [data-pl="product-title"]'
     EXAMPLE_URL = "https://www.aliexpress.com/item/1005006123456789.html"
 
     def extract_product_data(self, soup: BeautifulSoup, html: str, url: str) -> ProductData:
@@ -657,6 +888,11 @@ class SheinScraper(BaseScraper):
     DOMAINS = ("shein.com", "shein.co.uk", "us.shein.com", "shein.in")
     IMAGE_HOSTS = ("img.ltwebstatic.com", "ltwebstatic.com", "img.shein.com", "sheinsz.ltwebstatic.com")
     ID_PATTERNS = (r"-p-(\d+)\.html", r"goods_id=(\d+)", r"-p-(\d+)-cat")
+    PRODUCT_URL_HINTS = ("-p-", "goods_id=")
+    IMAGE_PATH_HINTS = ()  # Shein product images sit under /images3_pi/ etc.; host filter is enough
+    GALLERY_SELECTORS = ('[class*="gallery" i]', '[class*="swiper" i]',
+                         '[class*="crop-image" i]', '[class*="product-intro__main" i]')
+    WAIT_SELECTOR = 'h1, [class*="product-intro" i], [class*="goods" i]'
     EXAMPLE_URL = "https://www.shein.com/Product-Name-p-12345678.html"
 
     def extract_product_data(self, soup: BeautifulSoup, html: str, url: str) -> ProductData:
@@ -906,22 +1142,37 @@ def render_scrape_tab(file_manager: FileManager):
 
     st.caption(f"Example {platform} URL:  `{scraper_cls.EXAMPLE_URL}`")
 
+    # Browser-engine status — these sites need a real browser to render.
+    if BaseScraper.playwright_available():
+        st.caption("🟢 Browser engine ready (Playwright) — JavaScript pages will render fully.")
+    else:
+        st.warning(
+            "🔴 **Playwright is not installed.** Temu / Alibaba / AliExpress / Shein build "
+            "their pages with JavaScript, so a real browser engine is required to read them. "
+            "Install it once, then restart the app:\n\n"
+            "```\npip install playwright\nplaywright install chromium\n```"
+        )
+
     if go:
         handle_scrape(url, platform, file_manager)
 
-    with st.expander("ℹ️ Supported marketplaces & notes", expanded=False):
+    with st.expander("ℹ️ Supported marketplaces & how to copy a good link", expanded=False):
         st.markdown(
             """
-- **🟠 Temu** — `temu.com` product pages (`...-g-<id>.html`)
-- **🟧 Alibaba** — `alibaba.com` (`/product-detail/...<id>.html`)
-- **🔴 AliExpress** — `aliexpress.com`, `aliexpress.us` (`/item/<id>.html`)
-- **🖤 Shein** — `shein.com`, `us.shein.com` (`...-p-<id>.html`)
+**Paste the product page URL from your browser's address bar** — not a search,
+category, share or ad link.
 
-> **Heads-up:** these marketplaces render heavily with JavaScript and run
-> aggressive anti-bot protection. This tool reads structured data (JSON-LD),
-> OpenGraph/meta tags and embedded JSON — which works for many listings — but
-> some pages may block automated requests or hide data behind JavaScript. When
-> that happens you'll get a clear message rather than partial data.
+- **🟠 Temu** — `https://www.temu.com/<name>-g-<id>.html`
+- **🟧 Alibaba** — `https://www.alibaba.com/product-detail/<name>_<id>.html`
+- **🔴 AliExpress** — `https://www.aliexpress.com/item/<id>.html`
+- **🖤 Shein** — `https://www.shein.com/<name>-p-<id>.html`
+
+**Why a real browser is used:** these marketplaces render everything with
+JavaScript and run aggressive anti-bot protection. The app opens the page in a
+headless Chromium (Playwright), waits for the product to load, then extracts the
+title, price, specs, description and **only the product-gallery images** (logos,
+payment badges and UI icons are filtered out). If a site still blocks the
+request, you'll get a clear message instead of wrong data.
             """
         )
 
@@ -1031,6 +1282,32 @@ def main():
         initial_sidebar_state="expanded",
     )
     inject_global_styles()
+
+    # When Google Fonts is blocked on the network, Streamlit's Material Symbols
+    # icon font fails to load and expander / select carets render as raw ligature
+    # text ("keyboard_arrow_right") that overlaps labels. Clamp those icon spans
+    # so the broken text can never overflow onto neighbouring content.
+    st.markdown(
+        """
+        <style>
+        span[data-testid="stIconMaterial"],
+        [data-testid="stExpanderToggleIcon"],
+        .material-icons, .material-symbols-outlined,
+        span[class*="material-symbols"] {
+            max-width: 1.5rem !important;
+            max-height: 1.5rem !important;
+            overflow: hidden !important;
+            white-space: nowrap !important;
+            font-size: 1.1rem !important;
+            line-height: 1.5rem !important;
+            display: inline-flex !important;
+            flex: 0 0 auto !important;
+        }
+        details summary { gap: 0.4rem !important; align-items: center !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.markdown(
         """
