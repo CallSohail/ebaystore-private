@@ -2650,26 +2650,81 @@ def normalize_status(value: Any) -> str:
     return s if s in VALID_STATUSES else STATUS_PENDING
 
 
+_EXPECTED_FORMAT_HINT = (
+    "Expected columns (in order): Brand | S.NO | Link | Status. "
+    "The 3rd column must contain the eBay listing links; Status is optional."
+)
+
+
+def _sheet_has_links(raw: pd.DataFrame) -> bool:
+    """True when a raw (headerless) frame plausibly matches the batch format."""
+    if raw is None or raw.empty or raw.shape[1] <= LINK_COL:
+        return False
+    col = raw.iloc[:, LINK_COL].astype(str).str.lower()
+    return bool(col.str.contains('http', na=False).any() or col.str.contains('ebay\\.', na=False, regex=True).any())
+
+
+def _apply_header(raw: pd.DataFrame) -> pd.DataFrame:
+    """Turn a raw (headerless) frame into one with usable column names.
+
+    If the first row's 3rd cell already looks like a link, the sheet has no
+    header row and a synthetic one is added; otherwise the first row becomes
+    the header. Blank or duplicate header cells get unique fallback names.
+    """
+    first_link = str(raw.iloc[0, LINK_COL]).lower() if len(raw) else ''
+    if 'http' in first_link or 'ebay.' in first_link:
+        df = raw.copy()
+        names = ['Brand', 'S.NO', 'Link', 'Status'] + [f'Column {i + 1}' for i in range(4, df.shape[1])]
+        df.columns = names[:df.shape[1]]
+    else:
+        df = raw.iloc[1:].reset_index(drop=True).copy()
+        df.columns = [str(c).strip() for c in raw.iloc[0].tolist()]
+
+    # Make column names non-empty and unique so pandas operations stay sane
+    seen: Dict[str, int] = {}
+    cols: List[str] = []
+    for i, c in enumerate(df.columns):
+        name = str(c).strip() or f'Column {i + 1}'
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}.{seen[name]}"
+        else:
+            seen[name] = 0
+        cols.append(name)
+    df.columns = cols
+    return df
+
+
 def read_batch_upload(uploaded_file) -> pd.DataFrame:
     """Read an uploaded CSV/Excel batch file with every cell kept as a string.
 
     Reading as strings (with NaN suppressed) is what guarantees the extra
-    columns round-trip unmodified. Files without a header row are detected by
-    the third "header" cell looking like a URL, and get a synthetic header.
+    columns round-trip unmodified. For Excel workbooks every sheet is
+    scanned and the first one whose 3rd column contains links is used, so
+    uploading a workbook with the data on a later sheet still works. A clear
+    error is raised when no sheet matches the expected format.
     """
-    def _read(header):
+    name = uploaded_file.name.lower()
+    if name.endswith('.csv'):
         uploaded_file.seek(0)
-        if uploaded_file.name.lower().endswith('.csv'):
-            return pd.read_csv(uploaded_file, dtype=str, keep_default_na=False, header=header)
-        return pd.read_excel(uploaded_file, dtype=str, keep_default_na=False, header=header)
+        raw = pd.read_csv(uploaded_file, dtype=str, keep_default_na=False, header=None)
+        if not _sheet_has_links(raw):
+            raise ValueError(f"No eBay links found in the 3rd column of the file. {_EXPECTED_FORMAT_HINT}")
+        return _apply_header(raw)
 
-    df = _read(header=0)
-    if df.shape[1] > LINK_COL and 'http' in str(df.columns[LINK_COL]).lower():
-        df = _read(header=None)
-        names = ['Brand', 'S.NO', 'Link', 'Status'] + [f'Column {i + 1}' for i in range(4, df.shape[1])]
-        df.columns = names[:df.shape[1]]
-    df.columns = [str(c) for c in df.columns]
-    return df
+    uploaded_file.seek(0)
+    sheets = pd.read_excel(uploaded_file, sheet_name=None, dtype=str, keep_default_na=False, header=None)
+    if not sheets:
+        raise ValueError("The workbook contains no sheets.")
+    for sheet_name, raw in sheets.items():
+        if _sheet_has_links(raw):
+            if len(sheets) > 1:
+                logger.info(f"Batch upload: using sheet '{sheet_name}' (first sheet with links in column 3)")
+            return _apply_header(raw)
+    sheet_list = ", ".join(str(s) for s in sheets.keys())
+    raise ValueError(
+        f"None of the sheets ({sheet_list}) has eBay links in the 3rd column. {_EXPECTED_FORMAT_HINT}"
+    )
 
 
 def prepare_batch_dataframe(df: pd.DataFrame, scraper: "EbayScraper") -> Tuple[pd.DataFrame, Dict[str, str]]:
@@ -2700,8 +2755,19 @@ def prepare_batch_dataframe(df: pd.DataFrame, scraper: "EbayScraper") -> Tuple[p
             status_name += '_'
         df.insert(3, status_name, STATUS_PENDING)
 
+    def _link_key(link: str) -> str:
+        """Canonical key for duplicate detection: the eBay item id when we can
+        extract one (catches the same listing under different URL forms),
+        otherwise the normalized URL string."""
+        try:
+            item_id = scraper.extract_id_from_url(link)
+        except Exception:
+            item_id = None
+        return item_id or link.lower().rstrip('/')
+
     notes: Dict[str, str] = {}
     seen_serials: Dict[str, int] = {}
+    seen_links: Dict[str, int] = {}
     for i in range(len(df)):
         status = normalize_status(df.iat[i, STATUS_COL])
         serial = normalize_serial(df.iat[i, SERIAL_COL])
@@ -2720,24 +2786,77 @@ def prepare_batch_dataframe(df: pd.DataFrame, scraper: "EbayScraper") -> Tuple[p
                 valid = False
             if not valid:
                 reason = 'Not a recognised eBay URL.'
+            else:
+                key = _link_key(link)
+                if key in seen_links:
+                    reason = f'Duplicate link — same listing as data row {seen_links[key] + 1}.'
+                else:
+                    seen_links[key] = i
         if serial and serial not in seen_serials:
             seen_serials[serial] = i
         if reason:
             status = STATUS_ERROR
             notes[str(i)] = reason
         df.iat[i, STATUS_COL] = status
+
+    # If not a single row survived validation, the file is almost certainly in
+    # the wrong format — fail loudly with guidance instead of showing a table
+    # where everything is silently marked as error.
+    if len(notes) == len(df):
+        sample = "; ".join(list(dict.fromkeys(notes.values()))[:3])
+        raise ValueError(f"No usable rows found ({sample}). {_EXPECTED_FORMAT_HINT}")
     return df, notes
 
 
-def save_batch_state(df: pd.DataFrame, meta: Dict[str, Any]) -> None:
-    """Persist the working table + metadata so progress survives reruns/restarts."""
+def _atomic_write(path: Path, data: bytes, attempts: int = 4) -> bool:
+    """Write a file atomically (temp file + os.replace) with brief retries.
+
+    On Windows the target can be locked by another program (typically the CSV
+    open in Excel), which raises PermissionError/WinError 32 on a direct
+    write. Retrying a few times covers transient locks; a persistent lock is
+    reported to the caller instead of crashing the app.
+    """
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    last_err: Optional[BaseException] = None
+    for attempt in range(attempts):
+        try:
+            with open(tmp, 'wb') as f:
+                f.write(data)
+            os.replace(tmp, path)
+            return True
+        except OSError as e:
+            last_err = e
+            time.sleep(0.3 * (attempt + 1))
+    try:
+        if tmp.exists():
+            tmp.unlink()
+    except OSError:
+        pass
+    logger.error(
+        f"Could not write {path.name} after {attempts} attempts: {last_err}. "
+        "If the file is open in Excel or another program, close it there."
+    )
+    return False
+
+
+def save_batch_state(df: pd.DataFrame, meta: Dict[str, Any]) -> bool:
+    """Persist the working table + metadata so progress survives reruns/restarts.
+
+    Returns False when the state files are locked by another program. The
+    batch keeps running from memory in that case and results stay available
+    via the download button — nothing is lost, only the on-disk snapshot.
+    """
     try:
         with _BATCH_STATE_LOCK:
-            df.to_csv(BATCH_STATE_CSV, index=False, encoding='utf-8-sig')
-            with open(BATCH_STATE_META, 'w', encoding='utf-8') as f:
-                json.dump(meta, f, indent=2, ensure_ascii=False)
+            csv_ok = _atomic_write(BATCH_STATE_CSV, df.to_csv(index=False).encode('utf-8-sig'))
+            meta_ok = _atomic_write(
+                BATCH_STATE_META,
+                json.dumps(meta, indent=2, ensure_ascii=False).encode('utf-8'),
+            )
+        return csv_ok and meta_ok
     except Exception as e:
         logger.error(f"Failed to persist batch state: {e}")
+        return False
 
 
 def load_batch_state() -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
@@ -2755,13 +2874,23 @@ def load_batch_state() -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
     return None, {}
 
 
-def clear_batch_state() -> None:
+def clear_batch_state() -> bool:
+    """Delete the persisted state files. Returns False if a file is locked."""
+    all_ok = True
     for path in (BATCH_STATE_CSV, BATCH_STATE_META):
-        try:
-            if path.exists():
-                path.unlink()
-        except Exception as e:
-            logger.warning(f"Could not remove {path}: {e}")
+        removed = False
+        for attempt in range(3):
+            try:
+                if path.exists():
+                    path.unlink()
+                removed = True
+                break
+            except OSError as e:
+                logger.warning(f"Could not remove {path.name} (attempt {attempt + 1}): {e}")
+                time.sleep(0.3 * (attempt + 1))
+        if not removed:
+            all_ok = False
+    return all_ok
 
 
 def build_batch_download(df: pd.DataFrame, file_format: str, source_name: str) -> Tuple[bytes, str, str]:
@@ -2779,33 +2908,61 @@ def build_batch_download(df: pd.DataFrame, file_format: str, source_name: str) -
     return df.to_csv(index=False).encode('utf-8-sig'), f"{stem}_updated.csv", 'text/csv'
 
 
+def render_queue_view(df: pd.DataFrame, notes: Dict[str, str],
+                      metrics_slot, table_slot) -> None:
+    """Render (or re-render) the batch metrics and status table into the given
+    placeholders. Used both for the static view and for live updates while a
+    batch is running."""
+    statuses = df.iloc[:, STATUS_COL].astype(str).str.strip().str.lower()
+    with metrics_slot.container():
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total rows", len(df))
+        m2.metric("Pending", int((statuses == STATUS_PENDING).sum()))
+        m3.metric("Done", int((statuses == STATUS_DONE).sum()))
+        m4.metric("Errors", int((statuses == STATUS_ERROR).sum()))
+    view = df.copy()
+    view['Details'] = [notes.get(str(i), '') for i in range(len(df))]
+    table_slot.dataframe(view, width='stretch', hide_index=True)
+
+
 def process_batch_rows(df: pd.DataFrame, row_indices: List[int], scraper: "EbayScraper",
                        file_manager: "FileManager", notes: Dict[str, str],
-                       meta: Dict[str, Any]) -> Dict[str, int]:
+                       meta: Dict[str, Any], metrics_slot=None, table_slot=None) -> Dict[str, int]:
     """Process the given rows one at a time, persisting status after each row.
 
     Sequential on purpose: parallel workers sharing one session were the main
     cause of eBay rate-limit blocks and half-finished batches. Every row is
     isolated in its own try/except, so one bad listing can never abort the
     rest of the batch, and the scraper itself retries with a fresh identity
-    when eBay serves a bot-check page.
+    when eBay serves a bot-check page. The status table and metrics refresh
+    after every row when placeholders are provided.
     """
     progress = st.progress(0.0)
     status_box = st.empty()
     stats = {'done': 0, 'error': 0}
     total = len(row_indices)
+    persist_ok = True
 
     serial_counts: Dict[str, int] = {}
+    link_counts: Dict[str, int] = {}
     for j in range(len(df)):
         s = normalize_serial(df.iat[j, SERIAL_COL])
         if s:
             serial_counts[s] = serial_counts.get(s, 0) + 1
+        lk = str(df.iat[j, LINK_COL]).strip()
+        if lk:
+            try:
+                key = scraper.extract_id_from_url(lk) or lk.lower().rstrip('/')
+            except Exception:
+                key = lk.lower().rstrip('/')
+            link_counts[key] = link_counts.get(key, 0) + 1
     dup_serials = {s for s, n in serial_counts.items() if n > 1}
+    dup_links = {k for k, n in link_counts.items() if n > 1}
 
     for pos, i in enumerate(row_indices, start=1):
         serial = normalize_serial(df.iat[i, SERIAL_COL])
         link = str(df.iat[i, LINK_COL]).strip()
-        status_box.info(f"⏳ Processing {pos}/{total} — S.NO `{serial or '?'}` …")
+        status_box.info(f"Processing {pos}/{total} — S.NO {serial or '?'} …")
         try:
             if not serial:
                 raise ValidationError('Missing S.NO — cannot create a folder for this row.')
@@ -2813,6 +2970,12 @@ def process_batch_rows(df: pd.DataFrame, row_indices: List[int], scraper: "EbayS
                 raise ValidationError('Duplicate S.NO — give each row a unique serial number.')
             if not link or link.lower() in ('nan', 'none'):
                 raise ValidationError('Missing link.')
+            try:
+                link_key = scraper.extract_id_from_url(link) or link.lower().rstrip('/')
+            except Exception:
+                link_key = link.lower().rstrip('/')
+            if link_key in dup_links:
+                raise ValidationError('Duplicate link — this listing appears more than once in the file.')
 
             result = scraper.scrape_product(link)
             if result.success and result.product_data:
@@ -2845,19 +3008,27 @@ def process_batch_rows(df: pd.DataFrame, row_indices: List[int], scraper: "EbayS
             stats['error'] += 1
         finally:
             meta['notes'] = notes
-            save_batch_state(df, meta)
+            if not save_batch_state(df, meta):
+                persist_ok = False
             progress.progress(pos / total)
+            if metrics_slot is not None and table_slot is not None:
+                render_queue_view(df, notes, metrics_slot, table_slot)
             if pos < total:
                 # Polite delay between listings so eBay doesn't rate-limit us
                 time.sleep(random.uniform(1.0, 2.5))
 
-    status_box.success(f"✅ Batch finished — {stats['done']} done, {stats['error']} failed.")
+    status_box.success(f"Batch finished — {stats['done']} done, {stats['error']} failed.")
+    # Stash outcome messages in session state: the caller reruns the page
+    # right after this returns, which would wipe anything rendered here.
+    st.session_state.batch_last_run = f"Last run: {stats['done']} done, {stats['error']} failed."
+    if not persist_ok:
+        st.session_state.batch_persist_warning = True
     return stats
 
 
 def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> None:
     """CSV/Excel-driven batch processing tab."""
-    st.subheader("📦 Batch Processing")
+    st.subheader("Batch Processing")
     st.caption(
         "Upload a CSV or Excel file whose **first four columns** are "
         "`Brand | S.NO | Link | Status` (status may be blank — it defaults to "
@@ -2871,6 +3042,21 @@ def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> Non
         saved_df, saved_meta = load_batch_state()
         st.session_state.batch_df = saved_df
         st.session_state.batch_meta = saved_meta or {}
+
+    if st.session_state.pop('batch_clear_warning', False):
+        st.warning(
+            "The previous saved state file is open in another program "
+            "(usually Excel). Close it there so batch progress can be saved to disk."
+        )
+    if st.session_state.pop('batch_persist_warning', False):
+        st.warning(
+            "Batch progress could not be saved to disk because .batch_state.csv "
+            "is locked by another program (usually Excel). Close it there. Your "
+            "results are safe in this session — use Download Updated File to export them."
+        )
+    last_run = st.session_state.pop('batch_last_run', '')
+    if last_run:
+        st.success(last_run)
 
     # --- Upload ---
     uploaded_file = st.file_uploader(
@@ -2897,13 +3083,18 @@ def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> Non
                 st.session_state.batch_df = df
                 st.session_state.batch_meta = meta
                 st.session_state.batch_file_sig = file_sig
-                save_batch_state(df, meta)
-                st.toast(f"Imported {len(df)} row(s) from {uploaded_file.name}", icon="📥")
+                if not save_batch_state(df, meta):
+                    st.warning(
+                        "Could not save the batch to disk (.batch_state.csv is "
+                        "locked — close it in Excel). The batch will still run "
+                        "from memory in this session."
+                    )
+                st.toast(f"Imported {len(df)} row(s) from {uploaded_file.name}")
             except ValueError as ve:
-                st.error(f"❌ {ve}")
+                st.error(f"{ve}")
             except Exception as e:
                 logger.error(f"Failed reading batch upload: {traceback.format_exc()}")
-                st.error(f"❌ Could not read the file: {e}. Please upload a valid .csv or .xlsx file.")
+                st.error(f"Could not read the file: {e}. Please upload a valid .csv or .xlsx file.")
 
     df = st.session_state.get('batch_df')
     meta = st.session_state.get('batch_meta') or {}
@@ -2926,37 +3117,30 @@ def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> Non
             )
         return
 
-    # --- Queue view ---
+    # --- Queue view (placeholders so processing can refresh it live) ---
     st.markdown("---")
-    st.markdown(f"### 📋 Current Batch — `{meta.get('source_name', 'restored session')}`")
+    st.markdown(f"### Current Batch — `{meta.get('source_name', 'restored session')}`")
 
     statuses = df.iloc[:, STATUS_COL].astype(str).str.strip().str.lower()
     n_pending = int((statuses == STATUS_PENDING).sum())
-    n_done = int((statuses == STATUS_DONE).sum())
     n_error = int((statuses == STATUS_ERROR).sum())
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total rows", len(df))
-    m2.metric("Pending", n_pending)
-    m3.metric("Done", n_done)
-    m4.metric("Errors", n_error)
-
-    view = df.copy()
-    view['Details'] = [notes.get(str(i), '') for i in range(len(df))]
-    st.dataframe(view, width='stretch', hide_index=True)
+    metrics_slot = st.empty()
+    table_slot = st.empty()
+    render_queue_view(df, notes, metrics_slot, table_slot)
 
     # --- Actions ---
     col_a, col_b, col_c, col_d = st.columns(4)
     with col_a:
         process_clicked = st.button(
-            f"🚀 Process {n_pending} Pending",
+            f"Process {n_pending} Pending",
             type="primary",
             disabled=n_pending == 0,
             width='stretch',
         )
     with col_b:
         retry_clicked = st.button(
-            f"🔄 Retry {n_error} Failed",
+            f"Retry {n_error} Failed",
             disabled=n_error == 0,
             width='stretch',
         )
@@ -2965,14 +3149,16 @@ def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> Non
             payload, fname, mime = build_batch_download(
                 df, meta.get('format', 'csv'), meta.get('source_name', 'batch')
             )
-            st.download_button("⬇️ Download Updated File", data=payload,
+            st.download_button("Download Updated File", data=payload,
                                file_name=fname, mime=mime, width='stretch')
         except Exception as e:
             logger.error(f"Could not build batch download: {e}")
             st.warning("Download unavailable — see logs.")
     with col_d:
-        if st.button("🗑️ Clear Batch", width='stretch'):
-            clear_batch_state()
+        if st.button("Clear Batch", width='stretch'):
+            if not clear_batch_state():
+                # Surfaced after the rerun below, otherwise it would vanish
+                st.session_state.batch_clear_warning = True
             st.session_state.batch_df = None
             st.session_state.batch_meta = {}
             st.session_state.pop('batch_file_sig', None)
@@ -2998,16 +3184,17 @@ def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> Non
 
     if indices:
         st.markdown("---")
-        st.markdown("### ⚙️ Processing")
+        st.markdown("### Processing")
         st.caption(
             "Rows are processed one at a time with polite delays and automatic "
-            "retries; progress is saved after every row, so an interrupted "
-            "batch can always be resumed."
+            "retries; the table above refreshes after every row and progress "
+            "is saved continuously, so an interrupted batch can always be resumed."
         )
-        process_batch_rows(df, indices, scraper, file_manager, notes, meta)
+        process_batch_rows(df, indices, scraper, file_manager, notes, meta,
+                           metrics_slot=metrics_slot, table_slot=table_slot)
         st.session_state.batch_df = df
         st.session_state.batch_meta = meta
-        st.toast("Batch processing completed!", icon="🎉")
+        st.toast("Batch processing completed")
         time.sleep(1.0)
         st.rerun()
 
@@ -3124,13 +3311,13 @@ def render_image_format_tab(file_manager: "FileManager") -> None:
             if len(webp_files) > 50:
                 st.caption(f"...and {len(webp_files) - 50} more")
 
-    if st.button(f"🔁 Convert {len(webp_files)} WebP → {target}", type="primary", disabled=not webp_files):
+    if st.button(f"Convert {len(webp_files)} WebP → {target}", type="primary", disabled=not webp_files):
         with st.spinner("Converting..."):
             converted, failed, errors = convert_webp_in_folder(selected_folder, target)
         if converted:
-            st.success(f"✅ Converted {converted} image(s) to {target}. Originals removed.")
+            st.success(f"Converted {converted} image(s) to {target}. Originals removed.")
         if failed:
-            st.error(f"❌ {failed} image(s) failed to convert.")
+            st.error(f"{failed} image(s) failed to convert.")
             with st.expander("Show errors"):
                 for err in errors:
                     st.code(err, language=None)
@@ -3138,7 +3325,7 @@ def render_image_format_tab(file_manager: "FileManager") -> None:
             st.info("Nothing to convert.")
         st.rerun()
 
-def show_success_animation(message: str, icon: str = "✅"):
+def show_success_animation(message: str, icon: str = ""):
     """Display an animated success message."""
     st.markdown(
         f"""
@@ -3167,7 +3354,7 @@ def show_success_animation(message: str, icon: str = "✅"):
         unsafe_allow_html=True
     )
 
-def show_progress_stage(stage: str, icon: str = "⏳"):
+def show_progress_stage(stage: str, icon: str = ""):
     """Display a progress stage indicator."""
     st.markdown(
         f"""
@@ -3195,7 +3382,7 @@ def show_progress_stage(stage: str, icon: str = "⏳"):
         unsafe_allow_html=True
     )
 
-def show_metric_card(title: str, value: str, icon: str = "📊"):
+def show_metric_card(title: str, value: str, icon: str = ""):
     """Display an animated metric card."""
     st.markdown(
         f"""
@@ -3240,7 +3427,7 @@ def show_metric_card(title: str, value: str, icon: str = "📊"):
         unsafe_allow_html=True
     )
 
-def show_animated_success(message: str, icon: str = "✅"):
+def show_animated_success(message: str, icon: str = ""):
     """Display an animated success message with modern light theme styling."""
     st.markdown(
         f"""
@@ -3269,7 +3456,7 @@ def show_animated_success(message: str, icon: str = "✅"):
         unsafe_allow_html=True
     )
 
-def show_processing_stage(stage: str, icon: str = "⚙️"):
+def show_processing_stage(stage: str, icon: str = ""):
     """Display an animated processing stage indicator."""
     st.markdown(
         f"""
@@ -3336,6 +3523,18 @@ def inject_global_styles() -> None:
         html, body, .stApp, [class*="st-emotion"] {
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
             font-feature-settings: "ss01", "cv11";
+        }
+
+        /* Restore Streamlit's icon font: the rule above matches every
+           st-emotion element, which otherwise breaks Material Symbols
+           ligatures and renders icon names as raw text
+           ("keyboard_arrow_right" etc.). */
+        [data-testid="stIconMaterial"],
+        [data-testid="stExpanderToggleIcon"],
+        .material-symbols-rounded,
+        span[class*="material-symbols"] {
+            font-family: 'Material Symbols Rounded' !important;
+            font-feature-settings: 'liga' !important;
         }
         .stApp { background: var(--bg) !important; color: var(--text) !important; }
 
@@ -3982,11 +4181,11 @@ def display_scraping_results(result: ScrapingResult, downloaded_images: List[str
     
     # Expandables for details
     st.write("")
-    with st.expander("📝 View Full Product Description", expanded=False):
+    with st.expander("View Full Product Description", expanded=False):
         st.markdown(pd.description or "*No description available*")
     
     if pd.item_specifics:
-        with st.expander("📋 View Item Specifics", expanded=False):
+        with st.expander("View Item Specifics", expanded=False):
             # Create a clean grid layout for item specifics
             specifics_html = '<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem;">'
             
@@ -4006,7 +4205,7 @@ def display_scraping_results(result: ScrapingResult, downloaded_images: List[str
             
     # Quick Actions (e.g. Open Folder) - Streamlit can't easily open local folder on client side via button, 
     # but we can show the path text or provide a copy button.
-    st.success(f"📁 Data saved to: `{folder_path}`")
+    st.success(f"Data saved to: `{folder_path}`")
     
     # Add open folder buttons if running locally
     col_open_1, col_open_2 = st.columns(2)
@@ -4014,7 +4213,7 @@ def display_scraping_results(result: ScrapingResult, downloaded_images: List[str
          # Zip download button logic could go here if implemented
          pass
     with col_open_2:
-        if st.button("📂 Open Folder", key=f"open_folder_{folder_path.name}"):
+        if st.button("Open Folder", key=f"open_folder_{folder_path.name}"):
             try:
                 os.startfile(folder_path)
             except Exception:
@@ -4027,7 +4226,7 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
     """
     # Edge case: empty/whitespace input
     if not ebay_url or not ebay_url.strip():
-        st.error("⚠️ Please paste an eBay product URL before clicking Start scraping.")
+        st.error("Please paste an eBay product URL before clicking Start scraping.")
         return
 
     ebay_url = ebay_url.strip()
@@ -4047,7 +4246,7 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
     try:
         scraper.validate_ebay_url(ebay_url)
     except ValidationError as e:
-        st.error(f"❌ Invalid URL — {e}")
+        st.error(f"Invalid URL — {e}")
         st.caption("See **Supported URL formats** above for examples.")
         return
 
@@ -4057,18 +4256,18 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
     
     try:
         # SCRAPE
-        status_msg.markdown("**🔍 Extracting product data...**")
+        status_msg.markdown("**Extracting product data...**")
         progress_bar.progress(10)
         
         result = scraper.scrape_product(ebay_url)
         
         if not result.success:
-            status_msg.error(f"❌ Failed: {result.error_message}")
+            status_msg.error(f"Failed: {result.error_message}")
             progress_bar.empty()
             return
             
         progress_bar.progress(40)
-        status_msg.markdown("**📁 Setting up project workspace...**")
+        status_msg.markdown("**Setting up project workspace...**")
         
         # FSYSOPS
         folder_path = file_manager.create_product_folder(
@@ -4083,7 +4282,7 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
         file_manager.save_raw_scrape_text(result.product_data, folder_path)
         
         progress_bar.progress(60)
-        status_msg.markdown(f"**📸 Downloading {len(result.image_urls)} high-res images...**")
+        status_msg.markdown(f"**Downloading {len(result.image_urls)} high-res images...**")
         
         # IMAGES
         downloaded_images = []
@@ -4095,13 +4294,13 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
             downloaded_images = downloaded
         
         progress_bar.progress(85)
-        status_msg.markdown("**📊 Saving to local CSV...**")
+        status_msg.markdown("**Saving to local CSV...**")
 
         # CSV
         csv_updated = append_to_local_csv(result.product_data)
 
         progress_bar.progress(100)
-        status_msg.markdown("✅ **Success! Processing Complete.**")
+        status_msg.markdown("**Success! Processing Complete.**")
         time.sleep(1)
         status_msg.empty() # Clear status
         progress_bar.empty() # Clear progress
@@ -4113,7 +4312,7 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
         st.balloons()
         
     except Exception as e:
-        status_msg.error(f"❌ An unexpected error occurred: {str(e)}")
+        status_msg.error(f"An unexpected error occurred: {str(e)}")
         logger.error(f"Scrape handler error: {traceback.format_exc()}")
 
 def main():
@@ -4141,18 +4340,18 @@ def main():
     try:
         scraper, file_manager = initialize_components()
     except Exception as e:
-        st.error(f"❌ Failed to initialize application: {e}")
+        st.error(f"Failed to initialize application: {e}")
         return
 
     # Sidebar: brand + navigation + configuration. The sidebar can be
     # collapsed/expanded by the user via Streamlit's built-in chevron control.
     NAV_OPTIONS = [
-        ("Single Product", "🔍"),
-        ("Batch Processing", "📦"),
-        ("AI Processing", "🤖"),
-        ("Image Enhancement", "🎨"),
-        ("Image Format", "🖼️"),
-        ("Logs", "📜"),
+        "Single Product",
+        "Batch Processing",
+        "AI Processing",
+        "Image Enhancement",
+        "Image Format",
+        "Logs",
     ]
 
     with st.sidebar:
@@ -4169,18 +4368,8 @@ def main():
             unsafe_allow_html=True,
         )
 
-        st.markdown('<div class="es-side-section">Navigation</div>', unsafe_allow_html=True)
-        _page = st.radio(
-            "Navigation",
-            options=[f"{ico}  {name}" for name, ico in NAV_OPTIONS],
-            label_visibility="collapsed",
-            key="es_nav",
-        )
-        # Strip the icon prefix to get the canonical page name
-        active_page = _page.split("  ", 1)[1] if _page else NAV_OPTIONS[0][0]
-
         st.markdown('<div class="es-side-section">Configuration</div>', unsafe_allow_html=True)
-        st.caption("Storage: Local CSV (EbayStore_Products.csv)")
+        st.caption("Storage: EbayStore_Products.csv")
 
         stored_key = load_groq_api_key()
         groq_api_key = st.text_input(
@@ -4196,39 +4385,26 @@ def main():
         )
         if save_key and groq_api_key and groq_api_key != stored_key:
             if save_groq_api_key(groq_api_key):
-                st.success("API key saved", icon="✅")
+                st.success("API key saved")
             else:
                 st.warning("Could not save API key locally")
 
         if groq_api_key:
-            st.success("Groq API key configured", icon="🤖")
+            st.success("Groq API key configured")
         else:
-            st.info("Add API key to unlock AI features", icon="🔑")
-
-        st.markdown('<div class="es-side-section">About</div>', unsafe_allow_html=True)
-        st.caption("Tip: use the chevron at the top-left of the sidebar to collapse this panel.")
+            st.info("Add API key to unlock AI features")
 
     # Sidebar nav selects which tab is shown. We still use Streamlit's native
     # st.tabs() under the hood so the existing `with tabX:` blocks below
-    # continue to work unchanged. The page label drives which tab opens by
-    # default via the index argument. Tabs themselves are restyled as pills.
-    page_names = [name for name, _ in NAV_OPTIONS]
-    try:
-        _default_idx = page_names.index(active_page)
-    except ValueError:
-        _default_idx = 0
-
-    # The visible tab list still lets users click between sections at the top.
-    tab1, tab2, tab3, tab4, tab_fmt, tab5 = st.tabs(
-        [f"{ico}  {name}" for name, ico in NAV_OPTIONS]
-    )
+    # continue to work unchanged.
+    tab1, tab2, tab3, tab4, tab_fmt, tab5 = st.tabs(NAV_OPTIONS)
     
     # Tab 1: Single Product Scraping
     with tab1:
         st.markdown(
             """
             <div class="es-card">
-                <div class="es-card-title">🔍 Find a product</div>
+                <div class="es-card-title">Find a product</div>
                 <p class="es-card-sub">Paste any eBay listing URL — regional domains, short links (ebay.to), product pages and item URLs with tracking params are all supported.</p>
             </div>
             """,
@@ -4279,22 +4455,22 @@ def main():
         # Header
         col_header_1, col_header_2 = st.columns([3, 1])
         with col_header_1:
-            st.title("🤖 AI Content Studio")
+            st.title("AI Content Studio")
             st.caption("Generate platform-optimized descriptions and chat with your product data.")
         
         if not groq_api_key:
-            st.warning("⚠️ Please provide a Groq API key in the sidebar to use AI features.")
+            st.warning("Please provide a Groq API key in the sidebar to use AI features.")
             st.stop()
         
         # Sub-tabs
-        ai_tab1, ai_tab2 = st.tabs(["📝 Content Generator", "💬 AI Assistant"])
+        ai_tab1, ai_tab2 = st.tabs(["Content Generator", "AI Assistant"])
         
         # --- TAB 1: Content Generator ---
         with ai_tab1:
             product_folders = file_manager.get_existing_product_folders()
             
             if not product_folders:
-                st.info("📂 No scraped products found. Go to the Single Product tab to scrape some data first.")
+                st.info("No scraped products found. Go to the Single Product tab to scrape some data first.")
             else:
                 # Layout: Input Sidebar (Left) vs Output (Right)
                 col_input, col_output = st.columns([1, 1.5], gap="large")
@@ -4339,7 +4515,7 @@ def main():
                     
                     st.divider()
                     
-                    generate_btn = st.button("✨ Generate Description", type="primary", width='stretch')
+                    generate_btn = st.button("Generate Description", type="primary", width='stretch')
                 
                 with col_output:
                     st.markdown("### 3. Result")
@@ -4354,7 +4530,7 @@ def main():
                             if not original_content:
                                 st.error("Empty source file.")
                             else:
-                                with st.spinner(f"🔍 Analyzing and rewriting for {target_platform}..."):
+                                with st.spinner(f"Analyzing and rewriting for {target_platform}..."):
                                     groq_processor = GroqProcessor(groq_api_key)
                                     result_text = groq_processor.platform_agent.generate_platform_description(
                                         raw_text=original_content,
@@ -4373,7 +4549,7 @@ def main():
                                     out_path = Path(folder_info["folder_path"]) / out_name
                                     with open(out_path, 'w', encoding='utf-8') as f:
                                         f.write(result_text)
-                                    st.toast(f"Saved to {out_name}", icon="💾")
+                                    st.toast(f"Saved to {out_name}")
                                     
                         except Exception as e:
                             st.error(f"Generation failed: {e}")
@@ -4385,9 +4561,9 @@ def main():
                         st.text_area("Final Output", value=res['text'], height=500)
                         col_d1, col_d2 = st.columns(2)
                         with col_d1:
-                            st.download_button("📥 Download .txt", data=res['text'], file_name=f"listing_{res['platform']}.txt")
+                            st.download_button("Download .txt", data=res['text'], file_name=f"listing_{res['platform']}.txt")
                     else:
-                        st.info("👈 Select a product and click Generate to see the magic happen.")
+                        st.info("Select a product and click Generate to create a description.")
         
         # AI Tab 2: ChatGPT-style Chatbot with streaming
         with ai_tab2:
@@ -4565,7 +4741,7 @@ def main():
             with st.container():
                 c1, c2 = st.columns([1, 2])
                 with c1:
-                    st.markdown("### 🤖 AI Assistant")
+                    st.markdown("### AI Assistant")
                 with c2:
                     # Compact context selector
                     product_folders = file_manager.get_existing_product_folders()
@@ -4591,7 +4767,7 @@ def main():
             if not session['messages']:
                 st.markdown("""
                 <div style='text-align: center; margin: 3rem 0; color: #4b5563;'>
-                    <h3>👋 How can I help you?</h3>
+                    <h3>How can I help you?</h3>
                     <p>I can rewrite descriptions, analyze prices, or give you marketing ideas.</p>
                 </div>
                 """, unsafe_allow_html=True)
@@ -4599,17 +4775,17 @@ def main():
                 # Preset Questions
                 col_q1, col_q2, col_q3 = st.columns(3)
                 with col_q1:
-                    if st.button("📝 Rewrite Description", width='stretch'):
+                    if st.button("Rewrite Description", width='stretch'):
                         # We can't auto-submit to chat_input easily in Streamlit, 
                         # so we append to history to trigger "simulated" user message
                          session['messages'].append({"user": "Rewrite the current product description to be more professional.", "assistant": None})
                          st.rerun()
                 with col_q2:
-                    if st.button("📊 Price Analysis", width='stretch'):
+                    if st.button("Price Analysis", width='stretch'):
                          session['messages'].append({"user": "Analyze the pricing strategy for this item.", "assistant": None})
                          st.rerun()
                 with col_q3:
-                     if st.button("🏷️ Generate Tags", width='stretch'):
+                     if st.button("Generate Tags", width='stretch'):
                          session['messages'].append({"user": "Suggest 10 relevant SEO tags for this product.", "assistant": None})
                          st.rerun()
 
@@ -4630,9 +4806,9 @@ def main():
                         
                         col_copy, col_spacer = st.columns([1, 5])
                         with col_copy:
-                            if st.button("📋 Copy", key=copy_key + "_btn", type="secondary"):
+                            if st.button("Copy", key=copy_key + "_btn", type="secondary"):
                                 st.session_state[copy_key] = True
-                                st.toast("✅ Copied to clipboard!", icon="✅")
+                                st.toast("Copied to clipboard!")
                         
                         # Show the copyable text in an expander if user wants to manually copy
                         if st.session_state[copy_key]:
@@ -4717,7 +4893,7 @@ def main():
 #         """, unsafe_allow_html=True)
 
 #         # Folder selection via dropdowns for better UX
-#         st.markdown("<h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 1rem; margin-top: 1.5rem;'>📁 Select Folders</h3>", unsafe_allow_html=True)
+#         st.markdown("<h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 1rem; margin-top: 1.5rem;'>Select Folders</h3>", unsafe_allow_html=True)
 #         col_folder, col_logo = st.columns([2, 1])
 #         with col_folder:
 #             # Offer common folders under downloads plus manual typing
@@ -4762,14 +4938,14 @@ def main():
 #             folder_path = Path(base_folder)("� Vestiaire", width='stretch'):
 #                     st.session_state.chat_prompt = "Create a comprehensive luxury description for Vestiaire Collective that's professional and highlights authenticity, craftsmanship, and condition. Include all relevant details about materials, dimensions, and unique features. Minimum 250 words."
 #             with col_q3:
-#                 if st.button("🏷️ eBay", width='stretch'):
+#                 if st.button("eBay", width='stretch'):
 #                     st.session_state.chat_prompt = "Write a detailed eBay listing with complete product information, specifications, condition description, shipping details, and returns policy. Be thorough and professional. At least 300 words."
 #             with col_q4:
-#                 if st.button("📱 Instagram", width='stretch'):
+#                 if st.button("Instagram", width='stretch'):
 #                     st.session_state.chat_prompt = "Create an Instagram caption with emojis, engaging story, product highlights, and 15-20 relevant hashtags. Make it fun and shareable."
             
 #             # Context selection
-#             st.markdown("<h4 style='color: #000000; font-size: 1.1rem; font-weight: 600; margin-top: 1.5rem; margin-bottom: 1rem;'>🗂️ Add Context (Optional)</h4>", unsafe_allow_html=True)
+#             st.markdown("<h4 style='color: #000000; font-size: 1.1rem; font-weight: 600; margin-top: 1.5rem; margin-bottom: 1rem;'>Add Context (Optional)</h4>", unsafe_allow_html=True)
             
 #             col_ctx1, col_ctx2 = st.columns([1, 2])
             
@@ -4790,7 +4966,7 @@ def main():
 #             st.markdown("<hr style='margin: 1.5rem 0; border: none; border-top: 2px solid #e5e7eb;'>", unsafe_allow_html=True)
             
 #             # Chat input area
-#             st.markdown("<h4 style='color: #000000; font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem;'>💭 Your Message</h4>", unsafe_allow_html=True)
+#             st.markdown("<h4 style='color: #000000; font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem;'>Your Message</h4>", unsafe_allow_html=True)
             
 #             user_message = st.text_area(
 #                 "Message",
@@ -4807,7 +4983,7 @@ def main():
 #             col_send1, col_send2 = st.columns([3, 1])
             
 #             with col_send1:
-#                 send_button = st.button("📤 Send Message", type="primary", width='stretch')
+#                 send_button = st.button("Send Message", type="primary", width='stretch')
             
 #             with col_send2:
 #                 words_target = st.number_input("Min words", min_value=50, max_value=1000, value=200, step=50, label_visibility="collapsed", help="Minimum word count for AI response")
@@ -4841,7 +5017,7 @@ def main():
 # - Make it ready to use without needing editing{context_text}"""
                     
 #                     # Get AI response with spinner
-#                     with st.spinner("🤖 AI is crafting a comprehensive response..."):
+#                     with st.spinner("AI is crafting a comprehensive response..."):
 #                         ai_response = groq_processor.client.chat.completions.create(
 #                             model=groq_processor.model,
 #                             messages=[
@@ -4870,19 +5046,19 @@ def main():
 #                         st.rerun()
                         
 #                 except Exception as e:
-#                     st.error(f"❌ Chat error: {e}")
+#                     st.error(f"Chat error: {e}")
 #                     logger.error(f"Chat error: {traceback.format_exc()}")
             
 #             # Display chat history
 #             st.markdown("<hr style='margin: 2rem 0; border: none; border-top: 2px solid #e5e7eb;'>", unsafe_allow_html=True)
-#             st.markdown("<h4 style='color: #000000; font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem;'>📜 Conversation History</h4>", unsafe_allow_html=True)
+#             st.markdown("<h4 style='color: #000000; font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem;'>Conversation History</h4>", unsafe_allow_html=True)
             
 #             current_session = st.session_state.chat_sessions[st.session_state.active_session]
             
 #             if not current_session['messages']:
 #                 st.markdown("""
 #                 <div style='background: #f9fafb; padding: 2rem; border-radius: 8px; text-align: center; border: 2px dashed #d1d5db;'>
-#                     <p style='color: #6b7280; margin: 0; font-size: 0.95rem;'>💬 No messages yet. Start a conversation!</p>
+#                     <p style='color: #6b7280; margin: 0; font-size: 0.95rem;'>No messages yet. Start a conversation!</p>
 #                 </div>
 #                 """, unsafe_allow_html=True)
 #             else:
@@ -4892,7 +5068,7 @@ def main():
 #                     st.markdown(f"""
 #                     <div style='background: #eff6ff; padding: 1rem; border-radius: 8px; margin-bottom: 0.5rem; border-left: 4px solid #3b82f6;'>
 #                         <div style='display: flex; justify-content: space-between; margin-bottom: 0.5rem;'>
-#                             <strong style='color: #000000;'>👤 You</strong>
+#                             <strong style='color: #000000;'>You</strong>
 #                             <span style='color: #6b7280; font-size: 0.85rem;'>{msg['timestamp']}</span>
 #                         </div>
 #                         <p style='color: #374151; margin: 0; font-size: 0.95rem; white-space: pre-wrap;'>{msg['user']}</p>
@@ -4900,12 +5076,12 @@ def main():
 #                     """, unsafe_allow_html=True)
                     
 #                     # AI response
-#                     context_badge = f" | 📁 {msg['context_used']}" if msg.get('context_used') else ""
+#                     context_badge = f" | {msg['context_used']}" if msg.get('context_used') else ""
                     
 #                     st.markdown(f"""
 #                     <div style='background: #f0fdf4; padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem; border-left: 4px solid #10b981;'>
 #                         <div style='display: flex; justify-content: space-between; margin-bottom: 0.5rem;'>
-#                             <strong style='color: #000000;'>🤖 AI Assistant</strong>
+#                             <strong style='color: #000000;'>AI Assistant</strong>
 #                             <span style='color: #6b7280; font-size: 0.85rem;'>{msg['word_count']} words{context_badge}</span>
 #                         </div>
 #                         <div style='color: #374151; font-size: 0.95rem; white-space: pre-wrap; line-height: 1.6;'>{msg['ai']}</div>
@@ -4916,7 +5092,7 @@ def main():
 #                     col_dl1, col_dl2, col_dl3 = st.columns([2, 1, 1])
 #                     with col_dl1:
 #                         st.download_button(
-#                             label=f"💾 Download Response #{len(current_session['messages']) - idx}",
+#                             label=f"Download Response #{len(current_session['messages']) - idx}",
 #                             data=msg['ai'],
 #                             file_name=f"ai_response_{st.session_state.active_session}_{len(current_session['messages']) - idx}.txt",
 #                             mime="text/plain",
@@ -4925,7 +5101,7 @@ def main():
                 
 #                 # Clear all history button
 #                 st.markdown("<div style='margin-top: 2rem;'></div>", unsafe_allow_html=True)
-#                 if st.button("🗑️ Clear All Chat History", width='stretch', type="secondary"):
+#                 if st.button("Clear All Chat History", width='stretch', type="secondary"):
 #                     current_session['messages'] = []
 #                     st.rerun()
 
@@ -4940,7 +5116,7 @@ def main():
         """, unsafe_allow_html=True)
 
         # Folder selection via dropdowns for better UX
-        st.markdown("<h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 1rem; margin-top: 1.5rem;'>📁 Select Folders</h3>", unsafe_allow_html=True)
+        st.markdown("<h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 1rem; margin-top: 1.5rem;'>Select Folders</h3>", unsafe_allow_html=True)
         col_folder, col_logo = st.columns([2, 1])
         with col_folder:
             # Offer common folders under downloads plus manual typing
@@ -4976,7 +5152,7 @@ def main():
         # Quick Presets Section
         st.markdown("""
         <div style='margin-top: 2rem; margin-bottom: 1rem;'>
-            <h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem;'>⚡ Quick Presets</h3>
+            <h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem;'>Quick Presets</h3>
             <p style='color: #6b7280; font-size: 0.9rem; margin: 0;'>One-click settings for common use cases</p>
         </div>
         """, unsafe_allow_html=True)
@@ -4990,28 +5166,28 @@ def main():
         
         col_preset1, col_preset2, col_preset3, col_preset4 = st.columns(4)
         with col_preset1:
-            if st.button("🛒 eBay Ready", width='stretch', help="Clean, bright images for eBay listings"):
+            if st.button("eBay Ready", width='stretch', help="Clean, bright images for eBay listings"):
                 st.session_state.img_brightness = 1.10
                 st.session_state.img_contrast = 1.15
                 st.session_state.img_sharpness = 1.20
                 st.session_state.img_saturation = 1.05
                 st.rerun()
         with col_preset2:
-            if st.button("📸 Instagram", width='stretch', help="Vibrant, eye-catching images for social"):
+            if st.button("Instagram", width='stretch', help="Vibrant, eye-catching images for social"):
                 st.session_state.img_brightness = 1.05
                 st.session_state.img_contrast = 1.20
                 st.session_state.img_sharpness = 1.15
                 st.session_state.img_saturation = 1.25
                 st.rerun()
         with col_preset3:
-            if st.button("✨ Professional", width='stretch', help="Neutral, premium look"):
+            if st.button("Professional", width='stretch', help="Neutral, premium look"):
                 st.session_state.img_brightness = 1.02
                 st.session_state.img_contrast = 1.08
                 st.session_state.img_sharpness = 1.25
                 st.session_state.img_saturation = 0.98
                 st.rerun()
         with col_preset4:
-            if st.button("🔄 Reset", width='stretch', help="Reset to default values"):
+            if st.button("Reset", width='stretch', help="Reset to default values"):
                 st.session_state.img_brightness = 1.0
                 st.session_state.img_contrast = 1.0
                 st.session_state.img_sharpness = 1.0
@@ -5021,25 +5197,25 @@ def main():
         # Enhancement Settings Section (Manual Fine-tuning)
         st.markdown("""
         <div style='margin-top: 2rem; margin-bottom: 1rem;'>
-            <h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem;'>🎨 Fine-tune Settings</h3>
+            <h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem;'>Fine-tune Settings</h3>
             <p style='color: #6b7280; font-size: 0.9rem; margin: 0;'>Manually adjust brightness, contrast, sharpness, and saturation</p>
         </div>
         """, unsafe_allow_html=True)
         
         col_b, col_c, col_s, col_sat = st.columns(4)
         with col_b:
-            brightness = st.slider("☀️ Brightness", 0.1, 2.5, st.session_state.img_brightness, 0.01, key="brightness_slider")
+            brightness = st.slider("Brightness", 0.1, 2.5, st.session_state.img_brightness, 0.01, key="brightness_slider")
         with col_c:
             contrast = st.slider("◐ Contrast", 0.1, 2.5, st.session_state.img_contrast, 0.01, key="contrast_slider")
         with col_s:
-            sharpness = st.slider("🔍 Sharpness", 0.1, 3.0, st.session_state.img_sharpness, 0.01, key="sharpness_slider")
+            sharpness = st.slider("Sharpness", 0.1, 3.0, st.session_state.img_sharpness, 0.01, key="sharpness_slider")
         with col_sat:
-            saturation = st.slider("🎨 Saturation", 0.1, 2.5, st.session_state.img_saturation, 0.01, key="saturation_slider")
+            saturation = st.slider("Saturation", 0.1, 2.5, st.session_state.img_saturation, 0.01, key="saturation_slider")
 
         # Logo Watermark Settings Section
         st.markdown("""
         <div style='margin-top: 2rem; margin-bottom: 1rem;'>
-            <h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem;'>🏷️ Logo Watermark Settings</h3>
+            <h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem;'>Logo Watermark Settings</h3>
             <p style='color: #6b7280; font-size: 0.9rem; margin: 0;'>Configure logo size, position, and opacity</p>
         </div>
         """, unsafe_allow_html=True)
@@ -5060,7 +5236,7 @@ def main():
         # Image Selection Section
         st.markdown("""
         <div style='margin-top: 2rem; margin-bottom: 1rem;'>
-            <h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem;'>🖼️ Image Selection</h3>
+            <h3 style='color: #000000; font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem;'>Image Selection</h3>
         </div>
         """, unsafe_allow_html=True)
 
@@ -5076,13 +5252,13 @@ def main():
         if not image_files:
             st.markdown("""
             <div style='background: #eff6ff; padding: 1rem 1.25rem; border-radius: 8px; border-left: 4px solid #3b82f6; margin: 1rem 0;'>
-                <p style='color: #000000; margin: 0; font-size: 0.95rem;'>📂 No images found in the specified folder.</p>
+                <p style='color: #000000; margin: 0; font-size: 0.95rem;'>No images found in the specified folder.</p>
             </div>
             """, unsafe_allow_html=True)
         else:
             st.markdown(f"""
             <div style='background: #f0fdf4; padding: 1rem 1.25rem; border-radius: 8px; border-left: 4px solid #10b981; margin: 1rem 0;'>
-                <p style='color: #000000; margin: 0; font-size: 0.95rem; font-weight: 600;'>✅ Found {len(image_files)} images ready to process</p>
+                <p style='color: #000000; margin: 0; font-size: 0.95rem; font-weight: 600;'>Found {len(image_files)} images ready to process</p>
             </div>
             """, unsafe_allow_html=True)
             
@@ -5094,9 +5270,9 @@ def main():
             st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
             col_process, col_preview = st.columns([1, 1])
             with col_process:
-                process_btn = st.button("🚀 Enhance Selected Images", type="primary", width='stretch')
+                process_btn = st.button("Enhance Selected Images", type="primary", width='stretch')
             with col_preview:
-                preview_btn = st.button("👁️ Preview Settings", type="secondary", width='stretch')
+                preview_btn = st.button("Preview Settings", type="secondary", width='stretch')
             
             # Preview functionality
             if preview_btn and selections:
@@ -5157,8 +5333,8 @@ def main():
                     progress_bar.progress(1.0)
                     status_text.text("Processing complete!")
                     
-                    st.success(f"✅ Successfully processed {len(processed_paths)} images!")
-                    st.info(f"📁 Output folder: {output_root}")
+                    st.success(f"Successfully processed {len(processed_paths)} images!")
+                    st.info(f"Output folder: {output_root}")
                     
                     # Show sample of processed images
                     if processed_paths:
@@ -5172,7 +5348,7 @@ def main():
                                         pass
                                         
                 except Exception as e:
-                    st.error(f"❌ Image enhancement error: {e}")
+                    st.error(f"Image enhancement error: {e}")
                     logger.error(f"Image enhancement error: {traceback.format_exc()}")
 
     # Tab: Image Format (WebP conversion)
@@ -5181,13 +5357,13 @@ def main():
 
     # Tab 5: Logs
     with tab5:
-        st.subheader("📝 System Logs")
+        st.subheader("System Logs")
         
         col_l1, col_l2 = st.columns([4, 1])
         with col_l1:
             log_lines = 50
         with col_l2:
-            if st.button("🔄 Refresh Logs"):
+            if st.button("Refresh Logs"):
                 st.rerun()
                 
         try:
@@ -5199,7 +5375,7 @@ def main():
                     st.code(log_content, language="text")
                     
                 with open(log_filename, "rb") as f:
-                    st.download_button("💾 Download Full Log", f, file_name="ebay_scraper.log")
+                    st.download_button("Download Full Log", f, file_name="ebay_scraper.log")
             else:
                 st.info("No logs found yet.")
         except Exception as e:
@@ -5212,7 +5388,7 @@ def main():
     
     with col1:
         # Zip Download Feature
-        if st.button("📥 Download All Data (ZIP)"):
+        if st.button("Download All Data (ZIP)"):
             with st.spinner("Zipping files..."):
                 try:
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -5221,7 +5397,7 @@ def main():
                     
                     with open(f"{zip_path}.zip", "rb") as f:
                         st.download_button(
-                            label="💾 Confirm Download",
+                            label="Confirm Download",
                             data=f,
                             file_name=f"ebay_data_{timestamp}.zip",
                             mime="application/zip"
@@ -5232,7 +5408,7 @@ def main():
 
     with col2:
         # Safe Folder Opening (Local Only)
-        if st.button("📂 Open Downloads Folder (Local)"):
+        if st.button("Open Downloads Folder (Local)"):
             try:
                 import subprocess
                 import platform
@@ -5264,7 +5440,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        st.error(f"❌ Application error: {e}")
+        st.error(f"Application error: {e}")
         logger.critical(f"Application startup error: {traceback.format_exc()}")
         
         # Show error details in debug mode
