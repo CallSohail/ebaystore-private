@@ -8,7 +8,7 @@ Features include:
 - Concurrent image downloading with optimization
 - Local CSV storage (EbayStore_Products.csv)
 - AI-powered content enhancement with Groq
-- Batch processing capabilities (local JSON-backed queue)
+- Batch processing driven by an uploaded CSV/Excel file (Brand | S.NO | Link | Status)
 - Comprehensive error handling and logging
 - Modern UI with performance optimizations
 
@@ -21,7 +21,7 @@ import requests
 from bs4 import BeautifulSoup, Tag
 import os
 import re
-from io import StringIO
+from io import StringIO, BytesIO
 import pandas as pd
 import time
 import random
@@ -89,9 +89,20 @@ class NoProxyHTTPAdapter(HTTPAdapter):
 # CACHING AND AGENTS
 # =============================================================================
 
+# Rotating pool of realistic desktop browser User-Agents. eBay's anti-bot
+# system flags repeated fingerprints, so each scraper session picks a UA at
+# init time and retries after a failure pick a fresh one.
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0',
+]
+
 # Browser-like headers to avoid anti-bot detection
 REQUEST_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'User-Agent': USER_AGENTS[0],
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
     'Accept-Encoding': 'gzip, deflate, br',
@@ -686,13 +697,33 @@ class EbayScraper:
     
     def __init__(self):
         """Initialize the scraper with configured session."""
-        self.session = requests.Session()
-        # Configure session to bypass proxies
-        self.session.mount('http://', NoProxyHTTPAdapter())
-        self.session.mount('https://', NoProxyHTTPAdapter())
-        self.session.proxies = {}
-        self.session.headers.update(REQUEST_HEADERS)
+        self.session = self._build_session()
         logger.info("eBay scraper initialized")
+
+    def _build_session(self) -> requests.Session:
+        """Create a fresh session with a randomly chosen browser identity."""
+        session = requests.Session()
+        # Configure session to bypass proxies
+        session.mount('http://', NoProxyHTTPAdapter())
+        session.mount('https://', NoProxyHTTPAdapter())
+        session.proxies = {}
+        headers = dict(REQUEST_HEADERS)
+        headers['User-Agent'] = random.choice(USER_AGENTS)
+        session.headers.update(headers)
+        return session
+
+    def refresh_identity(self) -> None:
+        """Discard the current session (cookies + fingerprint) and start fresh.
+
+        Called between retries when eBay serves an interstitial/bot-check page:
+        a new cookie jar plus a different User-Agent usually clears the block.
+        """
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = self._build_session()
+        logger.info("Scraper identity refreshed (new session + user agent)")
     
     # Known eBay regional domains and short link hosts
     EBAY_DOMAINS = (
@@ -939,7 +970,26 @@ class EbayScraper:
             if not product_data.item_id:
                 product_data.item_id = self._extract_id_from_dom(soup)
                 
-            logger.info(f"Successfully extracted product data for: {product_data.title[:50]}... (ID: {product_data.item_id})")
+            # One consolidated warning instead of a storm of per-field ones.
+            missing = [
+                name for name, value in (
+                    ('title', product_data.title),
+                    ('price', product_data.price),
+                    ('condition', product_data.condition),
+                    ('seller', product_data.seller),
+                    ('shipping', product_data.shipping),
+                    ('location', product_data.location),
+                    ('returns', product_data.returns_policy),
+                    ('category', product_data.category),
+                ) if not value
+            ]
+            if missing:
+                logger.warning(
+                    f"Fields not found for {url}: {', '.join(missing)} "
+                    "(interstitial page or unsupported listing layout)"
+                )
+            if product_data.title:
+                logger.info(f"Successfully extracted product data for: {product_data.title[:50]}... (ID: {product_data.item_id})")
             return product_data
         
         except Exception as e:
@@ -1022,7 +1072,7 @@ class EbayScraper:
                 logger.debug(f"Selector {selector} failed for {field_name}: {e}")
                 continue
         
-        logger.warning(f"No {field_name} found using any selector")
+        logger.debug(f"No {field_name} found using any selector")
         return ""
     
     def _extract_price(self, soup: BeautifulSoup, selectors: List[str]) -> str:
@@ -1051,7 +1101,7 @@ class EbayScraper:
             except Exception:
                 continue
         
-        logger.warning("No price found using any method")
+        logger.debug("No price found using any method")
         return ""
     
     def _extract_item_specifics(self, soup: BeautifulSoup) -> Dict[str, str]:
@@ -1441,73 +1491,129 @@ class EbayScraper:
         # Default
         return 'jpg'
     
-    def scrape_product(self, url: str) -> ScrapingResult:
+    # Phrases that appear on eBay's bot-check / interstitial pages but not on
+    # real listings. Deliberately specific: generic words like "robot" false-
+    # positive on legitimate listings (e.g. robot vacuum cleaners).
+    BOT_PAGE_MARKERS = (
+        'pardon our interruption',
+        'checking your browser',
+        'please verify yourself',
+        'verify yourself to continue',
+        'reference id:',
+        'unusual traffic',
+        'splashui/captcha',
+        'are you a human',
+    )
+
+    def _looks_like_bot_page(self, soup: BeautifulSoup) -> bool:
+        """Detect eBay's anti-bot interstitial pages.
+
+        These pages return HTTP 200 but contain no listing content, which is
+        why extraction previously produced a storm of "No <field> found"
+        warnings and empty products. Detecting them up front lets the caller
+        retry with a fresh identity instead of saving garbage.
+        """
+        try:
+            text = soup.get_text(" ", strip=True).lower()
+            # Bot pages are short; only scan the head of real (huge) pages.
+            head = text[:5000]
+            if any(marker in head for marker in self.BOT_PAGE_MARKERS):
+                return True
+            # A "page" with almost no text and no title element is an
+            # interstitial or an error shell, not a listing.
+            if len(text) < 400 and not soup.select_one('h1'):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def scrape_product(self, url: str, max_attempts: int = 3) -> ScrapingResult:
         """
         Main scraping method that orchestrates the entire process.
-        Returns ScrapingResult with success/failure and detailed error messages.
+
+        Retries up to ``max_attempts`` times with a fresh browser identity
+        (new session, cookies and User-Agent) whenever eBay serves a
+        bot-check page or the page yields no usable data. Returns a
+        ScrapingResult with success/failure and a detailed error message —
+        this method never raises.
         """
         try:
             # Validate URL (raises ValidationError on bad input)
             self.validate_ebay_url(url)
-
             # Normalize to a canonical form when we can extract an item id
             url = self.normalize_ebay_url(url.strip())
-
-            # Add anti-detection delay
-            time.sleep(random.uniform(0.5, 2.0))
-
-            # Fetch page (requests follows redirects by default, handling ebay.to/ebay.us)
-            response = safe_request(self.session, url, timeout=30)
-            if not response:
-                return ScrapingResult(
-                    success=False, 
-                    error_message="Could not connect to eBay. Please check:\n• Your internet connection is stable\n• The eBay listing still exists\n• Wait 1-2 minutes if you've made many requests"
-                )
-            
-            # Check for eBay error pages
-            if response.status_code == 404:
-                return ScrapingResult(
-                    success=False,
-                    error_message="This eBay listing was not found. It may have been sold, removed, or the URL is incorrect."
-                )
-            
-            # Parse HTML
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Check for blocked/captcha pages
-            page_text = soup.get_text().lower()
-            if 'captcha' in page_text or 'robot' in page_text:
-                return ScrapingResult(
-                    success=False,
-                    error_message="eBay is requesting verification. Please wait a few minutes and try again."
-                )
-            
-            # Extract data
-            product_data = self.extract_product_data(soup, url)
-            image_urls = self.get_product_images(soup, url)
-            
-            # Validate we got essential data
-            if not product_data.title:
-                return ScrapingResult(
-                    success=False,
-                    error_message="Could not extract product title. The listing format may not be supported."
-                )
-            
-            return ScrapingResult(
-                success=True,
-                product_data=product_data,
-                image_urls=image_urls
-            )
-            
         except ValidationError as e:
             return ScrapingResult(success=False, error_message=f"Invalid URL: {e}. Please use a valid eBay product URL.")
-        except NetworkError as e:
-            return ScrapingResult(success=False, error_message=f"Network error: {e}. Check your internet connection.")
-        except DataExtractionError as e:
-            return ScrapingResult(success=False, error_message=f"Could not extract product data: {e}")
         except Exception as e:
-            logger.error(f"Unexpected error in scrape_product: {traceback.format_exc()}")
-            return ScrapingResult(success=False, error_message=f"An unexpected error occurred. Please try again.")
+            return ScrapingResult(success=False, error_message=f"Invalid URL: {e}")
+
+        last_error = "Unknown error"
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if attempt > 1:
+                    # eBay flagged the previous fingerprint — swap identity and
+                    # back off before retrying.
+                    self.refresh_identity()
+                    time.sleep(min(2 ** attempt, 8) + random.uniform(0.5, 2.0))
+                else:
+                    # Anti-detection delay before the first hit
+                    time.sleep(random.uniform(0.5, 2.0))
+
+                # Fetch page (requests follows redirects by default, handling ebay.to/ebay.us)
+                response = safe_request(self.session, url, timeout=30)
+                if not response:
+                    last_error = (
+                        "Could not fetch the eBay page. The listing may have been "
+                        "removed, or eBay is rate-limiting requests — wait 1-2 minutes and retry."
+                    )
+                    continue
+
+                # Parse HTML
+                soup = BeautifulSoup(response.content, 'html.parser')
+
+                # Check for blocked/captcha/interstitial pages
+                if self._looks_like_bot_page(soup):
+                    last_error = (
+                        "eBay served a verification page instead of the listing. "
+                        "Wait a few minutes and retry."
+                    )
+                    logger.warning(
+                        f"Bot-check page detected for {url} "
+                        f"(attempt {attempt}/{max_attempts}); retrying with a fresh identity"
+                    )
+                    continue
+
+                # Extract data
+                product_data = self.extract_product_data(soup, url)
+                image_urls = self.get_product_images(soup, url)
+
+                # Validate we got essential data
+                if not product_data.title:
+                    last_error = (
+                        "Could not extract the product title. The listing may have "
+                        "ended or its layout is not supported."
+                    )
+                    logger.warning(
+                        f"No title extracted for {url} "
+                        f"(attempt {attempt}/{max_attempts}); retrying with a fresh identity"
+                    )
+                    continue
+
+                return ScrapingResult(
+                    success=True,
+                    product_data=product_data,
+                    image_urls=image_urls
+                )
+
+            except NetworkError as e:
+                last_error = f"Network error: {e}. Check your internet connection."
+            except DataExtractionError as e:
+                last_error = f"Could not extract product data: {e}"
+            except Exception:
+                logger.error(f"Unexpected error in scrape_product (attempt {attempt}): {traceback.format_exc()}")
+                last_error = "An unexpected error occurred. Please try again."
+
+        return ScrapingResult(success=False, error_message=last_error)
 
 # =============================================================================
 # LOCAL CSV FALLBACK
@@ -2214,7 +2320,19 @@ class FileManager:
         except Exception as e:
             logger.error(f"Error creating product folder: {e}")
             raise
-    
+
+    def create_serial_folder(self, serial: str) -> Path:
+        """
+        Create and return a product folder named after a batch serial number
+        (the S.NO column of an uploaded batch file).
+        """
+        name = clean_filename(str(serial or "").strip(), max_length=60) or "Unknown"
+        folder = self.base_dir / name
+        folder.mkdir(parents=True, exist_ok=True)
+        logger.debug(f"Created serial folder: {folder}")
+        return folder
+
+
     def save_product_text(self, product_data: ProductData, folder_path: Path) -> Path:
         """
         Save product data to text file.
@@ -2493,284 +2611,404 @@ def save_groq_api_key(api_key: str) -> bool:
         return False
 
 # =============================================================================
-# BATCH QUEUE (LOCAL JSON-BACKED)
+# BATCH PROCESSING (CSV/Excel driven)
 # =============================================================================
+#
+# The batch workflow is driven entirely by an uploaded CSV/Excel file whose
+# first four columns are: Brand | S.NO | Link | Status. Only those four
+# columns are read; every other column is carried through untouched so the
+# downloadable result matches the uploaded file plus updated statuses.
 
-BATCH_QUEUE_PATH = Path.cwd() / '.batch_queue.json'
-_BATCH_QUEUE_LOCK = threading.Lock()
+BATCH_STATE_CSV = Path.cwd() / '.batch_state.csv'
+BATCH_STATE_META = Path.cwd() / '.batch_state_meta.json'
+_BATCH_STATE_LOCK = threading.Lock()
+
+STATUS_PENDING = 'pending'
+STATUS_DONE = 'done'
+STATUS_ERROR = 'error'
+VALID_STATUSES = {STATUS_PENDING, STATUS_DONE, STATUS_ERROR}
+
+# Positional indices of the four batch columns (the spec is positional, so
+# header names don't matter).
+BRAND_COL, SERIAL_COL, LINK_COL, STATUS_COL = 0, 1, 2, 3
 
 
-def parse_url_input(text: str) -> List[str]:
+def normalize_serial(value: Any) -> str:
+    """Normalize an S.NO cell into a clean, folder-safe string."""
+    s = str(value if value is not None else '').strip()
+    if not s or s.lower() in ('nan', 'none'):
+        return ''
+    # Excel reads integer serials back as floats ("1" -> "1.0")
+    if re.fullmatch(r'\d+\.0+', s):
+        s = s.split('.')[0]
+    return clean_filename(s, max_length=60)
+
+
+def normalize_status(value: Any) -> str:
+    """Map any status cell (any case, blank, NaN) onto pending/done/error."""
+    s = str(value if value is not None else '').strip().lower()
+    return s if s in VALID_STATUSES else STATUS_PENDING
+
+
+def read_batch_upload(uploaded_file) -> pd.DataFrame:
+    """Read an uploaded CSV/Excel batch file with every cell kept as a string.
+
+    Reading as strings (with NaN suppressed) is what guarantees the extra
+    columns round-trip unmodified. Files without a header row are detected by
+    the third "header" cell looking like a URL, and get a synthetic header.
     """
-    Parse a free-form blob of URLs into a clean list.
+    def _read(header):
+        uploaded_file.seek(0)
+        if uploaded_file.name.lower().endswith('.csv'):
+            return pd.read_csv(uploaded_file, dtype=str, keep_default_na=False, header=header)
+        return pd.read_excel(uploaded_file, dtype=str, keep_default_na=False, header=header)
 
-    Splits on newlines, commas, semicolons, tabs and surrounding whitespace.
-    Strips leading/trailing punctuation (quotes, commas, semicolons) so a
-    trailing comma like "https://...,," produces a single clean URL.
-    Empty tokens are dropped.
+    df = _read(header=0)
+    if df.shape[1] > LINK_COL and 'http' in str(df.columns[LINK_COL]).lower():
+        df = _read(header=None)
+        names = ['Brand', 'S.NO', 'Link', 'Status'] + [f'Column {i + 1}' for i in range(4, df.shape[1])]
+        df.columns = names[:df.shape[1]]
+    df.columns = [str(c) for c in df.columns]
+    return df
+
+
+def prepare_batch_dataframe(df: pd.DataFrame, scraper: "EbayScraper") -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Validate and normalize an uploaded batch table.
+
+    Returns the prepared DataFrame plus a {row_index: reason} map for rows
+    marked as error during validation (missing serial, duplicate serial,
+    missing/invalid link). Raises ValueError when the file is unusable.
     """
-    if not text:
-        return []
-    tokens = re.split(r'[\s,;]+', text)
-    cleaned: List[str] = []
-    for tok in tokens:
-        tok = tok.strip().strip('\'"').strip(',;')
-        if tok:
-            cleaned.append(tok)
-    return cleaned
+    if df is None or df.shape[1] < 3:
+        raise ValueError("The file must have at least 3 columns: Brand, S.NO and Link (Status is optional and defaults to pending).")
+
+    df = df.copy()
+
+    def _cell(row, idx) -> str:
+        return str(row.iloc[idx]).strip() if idx < len(row) else ''
+
+    # Drop rows where Brand, S.NO and Link are all empty (blank padding rows)
+    keep = df.apply(lambda r: any(_cell(r, i) for i in (BRAND_COL, SERIAL_COL, LINK_COL)), axis=1)
+    df = df[keep].reset_index(drop=True)
+    if df.empty:
+        raise ValueError("The file has no data rows.")
+
+    # Guarantee a Status column in position 4
+    if df.shape[1] < 4:
+        status_name = 'Status'
+        while status_name in df.columns:
+            status_name += '_'
+        df.insert(3, status_name, STATUS_PENDING)
+
+    notes: Dict[str, str] = {}
+    seen_serials: Dict[str, int] = {}
+    for i in range(len(df)):
+        status = normalize_status(df.iat[i, STATUS_COL])
+        serial = normalize_serial(df.iat[i, SERIAL_COL])
+        link = str(df.iat[i, LINK_COL]).strip()
+        reason = ''
+        if not serial:
+            reason = 'Missing S.NO — every row needs a serial number.'
+        elif serial in seen_serials:
+            reason = f'Duplicate S.NO — also used on data row {seen_serials[serial] + 1}.'
+        elif not link or link.lower() in ('nan', 'none'):
+            reason = 'Missing link.'
+        else:
+            try:
+                valid = scraper.validate_ebay_url(link)
+            except Exception:
+                valid = False
+            if not valid:
+                reason = 'Not a recognised eBay URL.'
+        if serial and serial not in seen_serials:
+            seen_serials[serial] = i
+        if reason:
+            status = STATUS_ERROR
+            notes[str(i)] = reason
+        df.iat[i, STATUS_COL] = status
+    return df, notes
 
 
-def load_batch_queue() -> List[Dict[str, Any]]:
-    """Load batch queue from local JSON file. Each item: {url, status, note, updated_at, error}."""
+def save_batch_state(df: pd.DataFrame, meta: Dict[str, Any]) -> None:
+    """Persist the working table + metadata so progress survives reruns/restarts."""
     try:
-        if BATCH_QUEUE_PATH.exists():
-            with open(BATCH_QUEUE_PATH, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return data
+        with _BATCH_STATE_LOCK:
+            df.to_csv(BATCH_STATE_CSV, index=False, encoding='utf-8-sig')
+            with open(BATCH_STATE_META, 'w', encoding='utf-8') as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        logger.warning(f"Could not read batch queue: {e}")
-    return []
+        logger.error(f"Failed to persist batch state: {e}")
 
 
-def save_batch_queue(queue: List[Dict[str, Any]]) -> bool:
+def load_batch_state() -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
     try:
-        with _BATCH_QUEUE_LOCK:
-            with open(BATCH_QUEUE_PATH, 'w', encoding='utf-8') as f:
-                json.dump(queue, f, indent=2)
-        return True
+        if BATCH_STATE_CSV.exists():
+            df = pd.read_csv(BATCH_STATE_CSV, dtype=str, keep_default_na=False, encoding='utf-8-sig')
+            meta: Dict[str, Any] = {}
+            if BATCH_STATE_META.exists():
+                with open(BATCH_STATE_META, 'r', encoding='utf-8') as f:
+                    meta = json.load(f) or {}
+            if not df.empty and df.shape[1] >= 4:
+                return df, meta
     except Exception as e:
-        logger.error(f"Failed to save batch queue: {e}")
-        return False
+        logger.warning(f"Could not load saved batch state: {e}")
+    return None, {}
 
 
-def update_queue_status(url: str, status: str, error: str = "") -> None:
-    """Thread-safe single-item status update persisted to disk."""
-    with _BATCH_QUEUE_LOCK:
-        queue = []
+def clear_batch_state() -> None:
+    for path in (BATCH_STATE_CSV, BATCH_STATE_META):
         try:
-            if BATCH_QUEUE_PATH.exists():
-                with open(BATCH_QUEUE_PATH, 'r', encoding='utf-8') as f:
-                    queue = json.load(f) or []
-        except Exception:
-            queue = []
-        for item in queue:
-            if item.get('url') == url:
-                item['status'] = status
-                item['error'] = error
-                item['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                break
-        try:
-            with open(BATCH_QUEUE_PATH, 'w', encoding='utf-8') as f:
-                json.dump(queue, f, indent=2)
+            if path.exists():
+                path.unlink()
         except Exception as e:
-            logger.error(f"Failed persisting queue status: {e}")
+            logger.warning(f"Could not remove {path}: {e}")
+
+
+def build_batch_download(df: pd.DataFrame, file_format: str, source_name: str) -> Tuple[bytes, str, str]:
+    """Serialize the current batch table for download in its original format."""
+    stem = Path(source_name or 'batch').stem or 'batch'
+    if file_format == 'xlsx':
+        buf = BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False)
+        return (
+            buf.getvalue(),
+            f"{stem}_updated.xlsx",
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+    return df.to_csv(index=False).encode('utf-8-sig'), f"{stem}_updated.csv", 'text/csv'
+
+
+def process_batch_rows(df: pd.DataFrame, row_indices: List[int], scraper: "EbayScraper",
+                       file_manager: "FileManager", notes: Dict[str, str],
+                       meta: Dict[str, Any]) -> Dict[str, int]:
+    """Process the given rows one at a time, persisting status after each row.
+
+    Sequential on purpose: parallel workers sharing one session were the main
+    cause of eBay rate-limit blocks and half-finished batches. Every row is
+    isolated in its own try/except, so one bad listing can never abort the
+    rest of the batch, and the scraper itself retries with a fresh identity
+    when eBay serves a bot-check page.
+    """
+    progress = st.progress(0.0)
+    status_box = st.empty()
+    stats = {'done': 0, 'error': 0}
+    total = len(row_indices)
+
+    serial_counts: Dict[str, int] = {}
+    for j in range(len(df)):
+        s = normalize_serial(df.iat[j, SERIAL_COL])
+        if s:
+            serial_counts[s] = serial_counts.get(s, 0) + 1
+    dup_serials = {s for s, n in serial_counts.items() if n > 1}
+
+    for pos, i in enumerate(row_indices, start=1):
+        serial = normalize_serial(df.iat[i, SERIAL_COL])
+        link = str(df.iat[i, LINK_COL]).strip()
+        status_box.info(f"⏳ Processing {pos}/{total} — S.NO `{serial or '?'}` …")
+        try:
+            if not serial:
+                raise ValidationError('Missing S.NO — cannot create a folder for this row.')
+            if serial in dup_serials:
+                raise ValidationError('Duplicate S.NO — give each row a unique serial number.')
+            if not link or link.lower() in ('nan', 'none'):
+                raise ValidationError('Missing link.')
+
+            result = scraper.scrape_product(link)
+            if result.success and result.product_data:
+                folder_path = file_manager.create_serial_folder(serial)
+                file_manager.save_product_description_markdown(result.product_data, folder_path)
+                file_manager.save_product_text(result.product_data, folder_path)
+                file_manager.save_raw_scrape_text(result.product_data, folder_path)
+                if result.image_urls:
+                    try:
+                        file_manager.download_images(scraper, result.image_urls, folder_path)
+                    except Exception as img_err:
+                        # Images are best-effort; the scraped data is already saved.
+                        logger.warning(f"Image download failed for S.NO {serial}: {img_err}")
+                append_to_local_csv(result.product_data)
+                df.iat[i, STATUS_COL] = STATUS_DONE
+                notes.pop(str(i), None)
+                stats['done'] += 1
+            else:
+                df.iat[i, STATUS_COL] = STATUS_ERROR
+                notes[str(i)] = (result.error_message or 'Unknown error')[:300]
+                stats['error'] += 1
+        except ValidationError as ve:
+            df.iat[i, STATUS_COL] = STATUS_ERROR
+            notes[str(i)] = str(ve)[:300]
+            stats['error'] += 1
+        except Exception as e:
+            logger.error(f"Batch row {i} (S.NO {serial}) failed: {traceback.format_exc()}")
+            df.iat[i, STATUS_COL] = STATUS_ERROR
+            notes[str(i)] = str(e)[:300]
+            stats['error'] += 1
+        finally:
+            meta['notes'] = notes
+            save_batch_state(df, meta)
+            progress.progress(pos / total)
+            if pos < total:
+                # Polite delay between listings so eBay doesn't rate-limit us
+                time.sleep(random.uniform(1.0, 2.5))
+
+    status_box.success(f"✅ Batch finished — {stats['done']} done, {stats['error']} failed.")
+    return stats
 
 
 def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> None:
-    """Local-CSV-backed batch processing tab."""
-    st.subheader("Batch Processing Operations")
-    st.caption("Queue is stored locally in `.batch_queue.json`. Scraped data is appended to `EbayStore_Products.csv`.")
+    """CSV/Excel-driven batch processing tab."""
+    st.subheader("📦 Batch Processing")
+    st.caption(
+        "Upload a CSV or Excel file whose **first four columns** are "
+        "`Brand | S.NO | Link | Status` (status may be blank — it defaults to "
+        "`pending`). Each scraped product is saved into a folder named after "
+        "its S.NO, the Status column is updated to `done` / `error`, and every "
+        "other column is carried through untouched."
+    )
 
-    if 'batch_queue' not in st.session_state:
-        st.session_state.batch_queue = load_batch_queue()
+    # Restore persisted state (survives page reruns and app restarts)
+    if 'batch_df' not in st.session_state:
+        saved_df, saved_meta = load_batch_state()
+        st.session_state.batch_df = saved_df
+        st.session_state.batch_meta = saved_meta or {}
 
-    # --- Add New Items Section ---
-    st.markdown("### 📥 Add Links to Batch")
+    # --- Upload ---
+    uploaded_file = st.file_uploader(
+        "Upload batch file",
+        type=['csv', 'xlsx', 'xls'],
+        help="Columns 1-4: Brand, S.NO, Link, Status. Extra columns are preserved as-is.",
+        key="batch_upload",
+    )
 
-    input_tab1, input_tab2 = st.tabs(["📁 File Upload (CSV/Excel)", "📝 Manual Paste"])
-
-    new_urls_to_add: List[str] = []
-    source_note = "Batch Import"
-
-    with input_tab1:
-        uploaded_file = st.file_uploader(
-            "Upload File",
-            type=['csv', 'xlsx', 'xls'],
-            help="Upload a list of URLs. Auto-detects URL/link/eBay column.",
-        )
-        if uploaded_file:
+    if uploaded_file is not None:
+        file_sig = f"{uploaded_file.name}:{uploaded_file.size}"
+        # Import once per uploaded file: Streamlit re-delivers the upload on
+        # every rerun, and re-importing would wipe processing progress.
+        if st.session_state.get('batch_file_sig') != file_sig:
             try:
-                if uploaded_file.name.lower().endswith('.csv'):
-                    df = pd.read_csv(uploaded_file)
-                else:
-                    df = pd.read_excel(uploaded_file)
-
-                if df is not None and not df.empty:
-                    possible_cols = [c for c in df.columns if any(x in str(c).lower() for x in ['url', 'link', 'ebay', 'website'])]
-                    target_col = possible_cols[0] if possible_cols else df.columns[0]
-                    st.caption(f"Reading URLs from column: `{target_col}`")
-                    raw = " ".join(df[target_col].dropna().astype(str).tolist())
-                    new_urls_to_add.extend(parse_url_input(raw))
-                    source_note = f"Import: {uploaded_file.name}"
+                raw_df = read_batch_upload(uploaded_file)
+                df, notes = prepare_batch_dataframe(raw_df, scraper)
+                meta = {
+                    'source_name': uploaded_file.name,
+                    'format': 'xlsx' if uploaded_file.name.lower().endswith(('.xlsx', '.xls')) else 'csv',
+                    'notes': notes,
+                    'imported_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                }
+                st.session_state.batch_df = df
+                st.session_state.batch_meta = meta
+                st.session_state.batch_file_sig = file_sig
+                save_batch_state(df, meta)
+                st.toast(f"Imported {len(df)} row(s) from {uploaded_file.name}", icon="📥")
+            except ValueError as ve:
+                st.error(f"❌ {ve}")
             except Exception as e:
-                st.error(f"Error reading file: {e}")
+                logger.error(f"Failed reading batch upload: {traceback.format_exc()}")
+                st.error(f"❌ Could not read the file: {e}. Please upload a valid .csv or .xlsx file.")
 
-    with input_tab2:
-        pasted_text = st.text_area(
-            "Paste eBay URLs (newline OR comma-separated; trailing commas are fine)",
-            height=200,
-            placeholder="https://www.ebay.com/itm/123, https://www.ebay.com/itm/456,\nhttps://www.ebay.com/itm/789",
-        )
-        if pasted_text:
-            new_urls_to_add.extend(parse_url_input(pasted_text))
-            if not source_note.startswith("Import"):
-                source_note = "Manual Paste"
+    df = st.session_state.get('batch_df')
+    meta = st.session_state.get('batch_meta') or {}
+    notes: Dict[str, str] = meta.get('notes') or {}
 
-    if new_urls_to_add:
-        valid_urls: List[str] = []
-        invalid_urls: List[str] = []
-        for u in new_urls_to_add:
-            try:
-                if scraper.validate_ebay_url(u):
-                    valid_urls.append(u)
-                else:
-                    invalid_urls.append(u)
-            except Exception:
-                invalid_urls.append(u)
+    if df is None or len(df) == 0:
+        st.info("No batch loaded yet. Upload a file above to begin.")
+        with st.expander("Expected file format", expanded=False):
+            st.markdown(
+                """
+| Brand | S.NO | Link | Status |
+|-------|------|------|--------|
+| Gucci | MB1079 | https://www.ebay.com/itm/1234567890 | pending |
+| Prada | MB1080 | https://www.ebay.fr/itm/9876543210 | |
 
-        valid_urls = list(dict.fromkeys(valid_urls))
-
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.success(f"✅ {len(valid_urls)} valid eBay URL(s) ready to add.")
-        with col_b:
-            if invalid_urls:
-                with st.expander(f"⚠️ {len(invalid_urls)} invalid entries skipped"):
-                    for bad in invalid_urls[:30]:
-                        st.code(bad, language=None)
-
-        if valid_urls and st.button(f"➕ Add {len(valid_urls)} Items to Queue", type="primary"):
-            existing_urls = {item['url'] for item in st.session_state.batch_queue}
-            added = 0
-            for url in valid_urls:
-                if url not in existing_urls:
-                    st.session_state.batch_queue.append({
-                        'url': url,
-                        'status': 'Pending',
-                        'note': source_note,
-                        'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'error': '',
-                    })
-                    existing_urls.add(url)
-                    added += 1
-            save_batch_queue(st.session_state.batch_queue)
-            if added:
-                st.toast(f"Added {added} new items to the batch queue!", icon="🚀")
-                st.rerun()
-            else:
-                st.warning("All provided URLs are already in the batch list.")
-
-    # --- Queue View ---
-    st.markdown("---")
-    st.markdown("### 📋 Current Queue")
-
-    queue = st.session_state.batch_queue
-    pending_items = [it for it in queue if it.get('status', '').lower() == 'pending']
-    done_items = [it for it in queue if it.get('status', '').lower() == 'done']
-    error_items = [it for it in queue if it.get('status', '').lower().startswith('error')]
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total", len(queue))
-    m2.metric("Pending", len(pending_items))
-    m3.metric("Done", len(done_items))
-    m4.metric("Errors", len(error_items))
-
-    if queue:
-        df_view = pd.DataFrame(queue)[['url', 'status', 'note', 'updated_at', 'error']]
-        st.dataframe(df_view, use_container_width=True, hide_index=True)
-
-        col_clear1, col_clear2, col_clear3 = st.columns(3)
-        with col_clear1:
-            if st.button("🗑️ Clear Done"):
-                st.session_state.batch_queue = [it for it in queue if it.get('status', '').lower() != 'done']
-                save_batch_queue(st.session_state.batch_queue)
-                st.rerun()
-        with col_clear2:
-            if st.button("🔄 Reset Errors to Pending"):
-                changed = 0
-                for it in st.session_state.batch_queue:
-                    if it.get('status', '').lower().startswith('error'):
-                        it['status'] = 'Pending'
-                        it['error'] = ''
-                        changed += 1
-                save_batch_queue(st.session_state.batch_queue)
-                if changed:
-                    st.toast(f"Reset {changed} error item(s).", icon="🔄")
-                    st.rerun()
-        with col_clear3:
-            if st.button("❌ Clear Entire Queue"):
-                st.session_state.batch_queue = []
-                save_batch_queue([])
-                st.rerun()
-
-    # --- Processing Section ---
-    st.markdown("---")
-    st.markdown("### ⚙️ Processing Control")
-
-    max_workers = st.slider("Max Concurrent Workers", min_value=1, max_value=8, value=3)
-
-    if not pending_items:
-        st.info("No pending items in the queue. Add URLs above to begin.")
+- **Status** may be `pending`, `done` or `error` (any capitalisation). Blank = pending.
+- Rows already marked `done` are skipped.
+- Any columns after the fourth (price, notes, …) are never modified.
+                """
+            )
         return
 
-    if st.button(f"🚀 Process {len(pending_items)} Pending Item(s)", type="primary"):
-        progress_bar = st.progress(0.0)
-        status_container = st.empty()
-        csv_lock = threading.Lock()
-        counter = {"success": 0, "fail": 0, "completed": 0}
-        total = len(pending_items)
+    # --- Queue view ---
+    st.markdown("---")
+    st.markdown(f"### 📋 Current Batch — `{meta.get('source_name', 'restored session')}`")
 
-        def process_one(url: str) -> None:
-            try:
-                update_queue_status(url, 'Processing')
-                result = scraper.scrape_product(url)
-                if result.success and result.product_data:
-                    folder_path = file_manager.create_product_folder(
-                        brand=result.product_data.brand,
-                        item_id=result.product_data.item_id,
-                        fallback_title=result.product_data.title,
-                    )
-                    file_manager.save_product_description_markdown(result.product_data, folder_path)
-                    file_manager.save_product_text(result.product_data, folder_path)
-                    file_manager.save_raw_scrape_text(result.product_data, folder_path)
-                    if result.image_urls:
-                        file_manager.download_images(scraper, result.image_urls, folder_path)
-                    with csv_lock:
-                        append_to_local_csv(result.product_data)
-                    update_queue_status(url, 'Done')
-                    counter["success"] += 1
-                else:
-                    msg = (result.error_message or 'Unknown error')[:200]
-                    update_queue_status(url, 'Error', error=msg)
-                    counter["fail"] += 1
-            except Exception as e:
-                logger.error(f"Batch worker error on {url}: {traceback.format_exc()}")
-                update_queue_status(url, 'Error', error=str(e)[:200])
-                counter["fail"] += 1
-            finally:
-                counter["completed"] += 1
+    statuses = df.iloc[:, STATUS_COL].astype(str).str.strip().str.lower()
+    n_pending = int((statuses == STATUS_PENDING).sum())
+    n_done = int((statuses == STATUS_DONE).sum())
+    n_error = int((statuses == STATUS_ERROR).sum())
 
-        urls_to_process = [it['url'] for it in pending_items]
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total rows", len(df))
+    m2.metric("Pending", n_pending)
+    m3.metric("Done", n_done)
+    m4.metric("Errors", n_error)
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(process_one, u) for u in urls_to_process]
-            while not all(f.done() for f in futures):
-                progress_bar.progress(counter["completed"] / total)
-                status_container.info(
-                    f"Completed: {counter['completed']}/{total} | "
-                    f"Success: {counter['success']} | Failed: {counter['fail']}"
-                )
-                time.sleep(0.5)
-            progress_bar.progress(1.0)
-            status_container.success(
-                f"Batch Finished! Success: {counter['success']}, Failed: {counter['fail']}"
+    view = df.copy()
+    view['Details'] = [notes.get(str(i), '') for i in range(len(df))]
+    st.dataframe(view, width='stretch', hide_index=True)
+
+    # --- Actions ---
+    col_a, col_b, col_c, col_d = st.columns(4)
+    with col_a:
+        process_clicked = st.button(
+            f"🚀 Process {n_pending} Pending",
+            type="primary",
+            disabled=n_pending == 0,
+            width='stretch',
+        )
+    with col_b:
+        retry_clicked = st.button(
+            f"🔄 Retry {n_error} Failed",
+            disabled=n_error == 0,
+            width='stretch',
+        )
+    with col_c:
+        try:
+            payload, fname, mime = build_batch_download(
+                df, meta.get('format', 'csv'), meta.get('source_name', 'batch')
             )
+            st.download_button("⬇️ Download Updated File", data=payload,
+                               file_name=fname, mime=mime, width='stretch')
+        except Exception as e:
+            logger.error(f"Could not build batch download: {e}")
+            st.warning("Download unavailable — see logs.")
+    with col_d:
+        if st.button("🗑️ Clear Batch", width='stretch'):
+            clear_batch_state()
+            st.session_state.batch_df = None
+            st.session_state.batch_meta = {}
+            st.session_state.pop('batch_file_sig', None)
+            st.rerun()
 
-        # Reload persisted queue to reflect statuses
-        st.session_state.batch_queue = load_batch_queue()
+    # --- Processing ---
+    indices: List[int] = []
+    if process_clicked:
+        indices = [i for i in range(len(df)) if statuses.iloc[i] == STATUS_PENDING]
+    elif retry_clicked:
+        # Retry reprocesses EVERY failed row plus anything still pending, so
+        # nothing gets silently skipped.
+        for i in range(len(df)):
+            if statuses.iloc[i] == STATUS_ERROR:
+                df.iat[i, STATUS_COL] = STATUS_PENDING
+                notes.pop(str(i), None)
+        meta['notes'] = notes
+        save_batch_state(df, meta)
+        indices = [
+            i for i in range(len(df))
+            if str(df.iat[i, STATUS_COL]).strip().lower() == STATUS_PENDING
+        ]
+
+    if indices:
+        st.markdown("---")
+        st.markdown("### ⚙️ Processing")
+        st.caption(
+            "Rows are processed one at a time with polite delays and automatic "
+            "retries; progress is saved after every row, so an interrupted "
+            "batch can always be resumed."
+        )
+        process_batch_rows(df, indices, scraper, file_manager, notes, meta)
+        st.session_state.batch_df = df
+        st.session_state.batch_meta = meta
         st.toast("Batch processing completed!", icon="🎉")
-        time.sleep(1.5)
+        time.sleep(1.0)
         st.rerun()
 
 
@@ -4011,7 +4249,7 @@ def main():
             scrape_button = st.button(
                 "Start scraping",
                 type="primary",
-                use_container_width=True,
+                width='stretch',
                 key="single_scrape_btn",
             )
 
@@ -4101,7 +4339,7 @@ def main():
                     
                     st.divider()
                     
-                    generate_btn = st.button("✨ Generate Description", type="primary", use_container_width=True)
+                    generate_btn = st.button("✨ Generate Description", type="primary", width='stretch')
                 
                 with col_output:
                     st.markdown("### 3. Result")
@@ -4361,17 +4599,17 @@ def main():
                 # Preset Questions
                 col_q1, col_q2, col_q3 = st.columns(3)
                 with col_q1:
-                    if st.button("📝 Rewrite Description", use_container_width=True):
+                    if st.button("📝 Rewrite Description", width='stretch'):
                         # We can't auto-submit to chat_input easily in Streamlit, 
                         # so we append to history to trigger "simulated" user message
                          session['messages'].append({"user": "Rewrite the current product description to be more professional.", "assistant": None})
                          st.rerun()
                 with col_q2:
-                    if st.button("📊 Price Analysis", use_container_width=True):
+                    if st.button("📊 Price Analysis", width='stretch'):
                          session['messages'].append({"user": "Analyze the pricing strategy for this item.", "assistant": None})
                          st.rerun()
                 with col_q3:
-                     if st.button("🏷️ Generate Tags", use_container_width=True):
+                     if st.button("🏷️ Generate Tags", width='stretch'):
                          session['messages'].append({"user": "Suggest 10 relevant SEO tags for this product.", "assistant": None})
                          st.rerun()
 
@@ -4521,13 +4759,13 @@ def main():
 #         # List images in folder
 #         image_files = []
 #         try:
-#             folder_path = Path(base_folder)("� Vestiaire", use_container_width=True):
+#             folder_path = Path(base_folder)("� Vestiaire", width='stretch'):
 #                     st.session_state.chat_prompt = "Create a comprehensive luxury description for Vestiaire Collective that's professional and highlights authenticity, craftsmanship, and condition. Include all relevant details about materials, dimensions, and unique features. Minimum 250 words."
 #             with col_q3:
-#                 if st.button("🏷️ eBay", use_container_width=True):
+#                 if st.button("🏷️ eBay", width='stretch'):
 #                     st.session_state.chat_prompt = "Write a detailed eBay listing with complete product information, specifications, condition description, shipping details, and returns policy. Be thorough and professional. At least 300 words."
 #             with col_q4:
-#                 if st.button("📱 Instagram", use_container_width=True):
+#                 if st.button("📱 Instagram", width='stretch'):
 #                     st.session_state.chat_prompt = "Create an Instagram caption with emojis, engaging story, product highlights, and 15-20 relevant hashtags. Make it fun and shareable."
             
 #             # Context selection
@@ -4569,7 +4807,7 @@ def main():
 #             col_send1, col_send2 = st.columns([3, 1])
             
 #             with col_send1:
-#                 send_button = st.button("📤 Send Message", type="primary", use_container_width=True)
+#                 send_button = st.button("📤 Send Message", type="primary", width='stretch')
             
 #             with col_send2:
 #                 words_target = st.number_input("Min words", min_value=50, max_value=1000, value=200, step=50, label_visibility="collapsed", help="Minimum word count for AI response")
@@ -4687,7 +4925,7 @@ def main():
                 
 #                 # Clear all history button
 #                 st.markdown("<div style='margin-top: 2rem;'></div>", unsafe_allow_html=True)
-#                 if st.button("🗑️ Clear All Chat History", use_container_width=True, type="secondary"):
+#                 if st.button("🗑️ Clear All Chat History", width='stretch', type="secondary"):
 #                     current_session['messages'] = []
 #                     st.rerun()
 
@@ -4752,28 +4990,28 @@ def main():
         
         col_preset1, col_preset2, col_preset3, col_preset4 = st.columns(4)
         with col_preset1:
-            if st.button("🛒 eBay Ready", use_container_width=True, help="Clean, bright images for eBay listings"):
+            if st.button("🛒 eBay Ready", width='stretch', help="Clean, bright images for eBay listings"):
                 st.session_state.img_brightness = 1.10
                 st.session_state.img_contrast = 1.15
                 st.session_state.img_sharpness = 1.20
                 st.session_state.img_saturation = 1.05
                 st.rerun()
         with col_preset2:
-            if st.button("📸 Instagram", use_container_width=True, help="Vibrant, eye-catching images for social"):
+            if st.button("📸 Instagram", width='stretch', help="Vibrant, eye-catching images for social"):
                 st.session_state.img_brightness = 1.05
                 st.session_state.img_contrast = 1.20
                 st.session_state.img_sharpness = 1.15
                 st.session_state.img_saturation = 1.25
                 st.rerun()
         with col_preset3:
-            if st.button("✨ Professional", use_container_width=True, help="Neutral, premium look"):
+            if st.button("✨ Professional", width='stretch', help="Neutral, premium look"):
                 st.session_state.img_brightness = 1.02
                 st.session_state.img_contrast = 1.08
                 st.session_state.img_sharpness = 1.25
                 st.session_state.img_saturation = 0.98
                 st.rerun()
         with col_preset4:
-            if st.button("🔄 Reset", use_container_width=True, help="Reset to default values"):
+            if st.button("🔄 Reset", width='stretch', help="Reset to default values"):
                 st.session_state.img_brightness = 1.0
                 st.session_state.img_contrast = 1.0
                 st.session_state.img_sharpness = 1.0
@@ -4856,9 +5094,9 @@ def main():
             st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
             col_process, col_preview = st.columns([1, 1])
             with col_process:
-                process_btn = st.button("🚀 Enhance Selected Images", type="primary", use_container_width=True)
+                process_btn = st.button("🚀 Enhance Selected Images", type="primary", width='stretch')
             with col_preview:
-                preview_btn = st.button("👁️ Preview Settings", type="secondary", use_container_width=True)
+                preview_btn = st.button("👁️ Preview Settings", type="secondary", width='stretch')
             
             # Preview functionality
             if preview_btn and selections:
@@ -4879,7 +5117,7 @@ def main():
                             opacity=logo_opacity
                         )
                     
-                    st.image(preview_img, caption="Preview with current settings", use_container_width=True)
+                    st.image(preview_img, caption="Preview with current settings", width='stretch')
                 except Exception as e:
                     st.error(f"Preview error: {e}")
 
@@ -4929,7 +5167,7 @@ def main():
                             for idx, img_path in enumerate(processed_paths[:6]):  # Show max 6 images
                                 with cols[idx % 3]:
                                     try:
-                                        st.image(str(img_path), caption=img_path.name, use_container_width=True)
+                                        st.image(str(img_path), caption=img_path.name, width='stretch')
                                     except Exception:
                                         pass
                                         
