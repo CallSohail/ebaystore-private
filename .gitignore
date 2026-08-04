@@ -17,6 +17,7 @@ __pycache__/
 batch_status_log.csv
 EbayStore_Products.csv
 downloads/
+blocked_pages/
 
 # OS
 .DS_Store

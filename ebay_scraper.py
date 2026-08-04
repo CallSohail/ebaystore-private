@@ -35,6 +35,7 @@ import traceback
 import unicodedata
 from dataclasses import dataclass, asdict
 from datetime import datetime
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
@@ -75,6 +76,49 @@ os.environ['http_proxy'] = ''
 os.environ['https_proxy'] = ''
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ---------------------------------------------------------------------------
+# HTTP transport
+# ---------------------------------------------------------------------------
+# eBay's edge fingerprints the TLS handshake, not just the headers. `requests`
+# always produces the same handshake, and it matches no real browser — so a
+# request claiming to be Chrome in its User-Agent contradicts itself at the
+# TLS layer, which is one of the cheapest possible bot signals. Rotating the
+# User-Agent cannot fix that mismatch, which is why identity refreshes alone
+# never cleared the block.
+#
+# curl_cffi replays a real browser's TLS/HTTP2 fingerprint, so the handshake
+# and the User-Agent finally agree. It is optional: when it is not installed
+# the app falls back to `requests` and simply keeps the old behaviour.
+try:
+    from curl_cffi import requests as curl_requests
+    CURL_CFFI_AVAILABLE = True
+except Exception:  # pragma: no cover - depends on the install
+    curl_requests = None
+    CURL_CFFI_AVAILABLE = False
+
+# Impersonation targets paired with the matching User-Agent, so the two
+# always tell the same story.
+IMPERSONATION_PROFILES = [
+    ("chrome131", 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'),
+    ("chrome136", 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'),
+    ("safari180", 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15'),
+    ("firefox133", 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0'),
+]
+
+# Exceptions that mean "the request did not complete". curl_cffi raises its
+# own hierarchy, unrelated to requests', so both are caught.
+NETWORK_EXCEPTIONS: Tuple[type, ...] = (requests.RequestException,)
+if CURL_CFFI_AVAILABLE:
+    try:
+        NETWORK_EXCEPTIONS = NETWORK_EXCEPTIONS + (curl_requests.errors.RequestsError,)
+    except Exception:
+        NETWORK_EXCEPTIONS = NETWORK_EXCEPTIONS + (Exception,)
+
+
+def transport_name() -> str:
+    """Which HTTP transport is active, for display in the UI."""
+    return "curl_cffi (browser TLS fingerprint)" if CURL_CFFI_AVAILABLE else "requests (basic TLS)"
 
 
 class NoProxyHTTPAdapter(HTTPAdapter):
@@ -556,6 +600,18 @@ WORKSHEET_NAMES_TO_TRY = [
 ]
 DEFAULT_SHEET_ID = "1YsDXTexrtz3h-uaErbwhLZlDVGLDUKoIT3By-5UrhLI"
 
+# Pages rejected as bot-checks are kept here so a real block can be told
+# apart from a detection false positive.
+BLOCKED_PAGES_DIR = "blocked_pages"
+BLOCKED_PAGES_KEEP = 10
+
+# A run gives up after this many listings are blocked back to back: grinding
+# through the rest of the file against an active block wastes the user's time
+# and keeps hammering an edge that is already refusing traffic.
+MAX_CONSECUTIVE_BLOCKED_ROWS = 3
+# How long to wait before a blocked run is worth retrying.
+BLOCK_COOLDOWN_MINUTES = 15
+
 # Downloaded images are normalised to JPEG. eBay serves WebP to modern
 # browsers and most listing tools and photo editors still cannot open it.
 SAVE_IMAGES_AS_JPEG = True
@@ -607,16 +663,29 @@ LABELS_RETURNS = [
 ]
 
 
+# The longest label in any of the lists below, with headroom. Text nodes
+# longer than this cannot be a label, and skipping them avoids running the
+# Unicode normalisation over every paragraph on the page.
+MAX_LABEL_LENGTH = 48
+
+
+@lru_cache(maxsize=8192)
 def normalize_label(text: str) -> str:
     """Fold a label to a comparable form: lowercase, unaccented, no trailing colon.
 
     Folding accents means the label lists do not have to carry every spelling
-    variant ('État', 'Etat', 'ETAT') for each language.
+    variant ('État', 'Etat', 'ETAT') for each language. Cached because the
+    same short strings recur across a page and across a batch.
     """
     value = str(text or '').strip().lower()
     value = value.rstrip(':').strip()
     decomposed = unicodedata.normalize('NFKD', value)
     return ''.join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
+def is_label_candidate(text: str) -> bool:
+    """Cheap pre-filter: only short strings can be a field label."""
+    return bool(text) and len(text) <= MAX_LABEL_LENGTH
 
 
 def convert_bytes_to_jpeg(payload: bytes, quality: int = JPEG_QUALITY) -> Optional[bytes]:
@@ -867,7 +936,7 @@ def safe_request(session: requests.Session, url: str, timeout: int = 30,
             status = e.response.status_code if e.response is not None else 0
             last = FetchOutcome(None, 'network', f"HTTP {status}")
             logger.warning(f"HTTP error {status} for {url} on attempt {attempt + 1}")
-        except requests.RequestException as e:
+        except NETWORK_EXCEPTIONS as e:
             last = FetchOutcome(None, 'network', str(e)[:200])
             logger.warning(f"Request failed: {e}. Attempt {attempt + 1}/{max_retries}")
 
@@ -952,23 +1021,48 @@ class EbayScraper:
 
     def __init__(self):
         """Initialize the scraper with configured session."""
+        self.impersonation = ''
         self.session = self._build_session()
         self._warmed_hosts: set = set()
+        # The scraper is shared across browser tabs (it is cached per process),
+        # and Streamlit runs each tab in its own thread. Serialising listing
+        # fetches keeps two tabs from sharing one HTTP session concurrently and,
+        # more importantly, from doubling the request rate into eBay — which is
+        # the surest way to get the whole IP thrown into an anti-bot check.
+        self._fetch_lock = threading.Lock()
         # Consecutive blocked fetches, used to slow down before eBay does it
         # for us. Reset by any successful listing fetch.
         self.consecutive_blocks = 0
         logger.info("eBay scraper initialized")
 
-    def _build_session(self) -> requests.Session:
-        """Create a fresh session with a randomly chosen browser identity."""
+    def _build_session(self):
+        """Create a fresh session with a coherent browser identity.
+
+        When curl_cffi is installed the TLS fingerprint and the User-Agent are
+        chosen as a matched pair, so the handshake and the header agree. With
+        plain requests only the header can be set, and the mismatch remains.
+        """
+        profile, user_agent = random.choice(IMPERSONATION_PROFILES)
+        headers = dict(REQUEST_HEADERS)
+        headers['User-Agent'] = user_agent
+
+        if CURL_CFFI_AVAILABLE:
+            try:
+                session = curl_requests.Session(impersonate=profile)
+                session.headers.update(headers)
+                self.impersonation = profile
+                return session
+            except Exception as e:
+                # An unknown target in an older curl_cffi build should not
+                # take the scraper down; fall through to requests.
+                logger.warning(f"curl_cffi session with '{profile}' failed ({e}); using requests")
+
         session = requests.Session()
-        # Configure session to bypass proxies
         session.mount('http://', NoProxyHTTPAdapter())
         session.mount('https://', NoProxyHTTPAdapter())
         session.proxies = {}
-        headers = dict(REQUEST_HEADERS)
-        headers['User-Agent'] = random.choice(USER_AGENTS)
         session.headers.update(headers)
+        self.impersonation = ''
         return session
 
     def refresh_identity(self) -> None:
@@ -1017,7 +1111,7 @@ class EbayScraper:
             self.session.get(f"https://{host}/", timeout=15)
             time.sleep(random.uniform(0.8, 1.8))
             logger.debug(f"Warmed up session for {host}")
-        except requests.RequestException as e:
+        except NETWORK_EXCEPTIONS as e:
             # Not fatal: the listing request may still succeed on its own.
             logger.debug(f"Warm-up request for {host} failed: {e}")
 
@@ -1412,21 +1506,27 @@ class EbayScraper:
                 logger.debug(f"Label modifier {modifier} failed for {field_name}: {e}")
 
         wanted = {normalize_label(label) for label in labels}
+
+        # Search the text nodes rather than the elements. Calling get_text()
+        # on every div re-walks that div's whole subtree, so on a real listing
+        # (20k+ elements, deeply nested) the element scan is quadratic and
+        # costs hundreds of milliseconds per field. Label text is short and
+        # lives in exactly one text node, so matching strings directly is both
+        # faster and more precise.
         try:
-            candidates = soup.find_all(['span', 'div', 'th', 'dt', 'td', 'label'])
+            matches = soup.find_all(
+                string=lambda s: is_label_candidate(s) and normalize_label(s) in wanted
+            )
         except Exception:
             return ''
 
-        for node in candidates:
-            try:
-                text = normalize_label(node.get_text(' ', strip=True))
-            except Exception:
+        for text_node in matches:
+            parent = text_node.parent
+            if parent is None:
                 continue
-            if text not in wanted:
-                continue
-            value = self._value_near_label(node)
+            value = self._value_near_label(parent)
             if value:
-                logger.debug(f"Extracted {field_name} by label text '{text}'")
+                logger.debug(f"Extracted {field_name} by label text")
                 return value
         return ''
 
@@ -1968,43 +2068,79 @@ class EbayScraper:
         'verifica que eres humano',
     )
 
-    def _looks_like_bot_page(self, soup: BeautifulSoup) -> bool:
-        """Detect eBay's anti-bot interstitial pages.
+    # Elements that only ever appear on a genuine item page. Their presence
+    # is what keeps the structural check below from firing on a real listing
+    # whose class names have drifted.
+    LISTING_MARKERS = (
+        'h1.x-item-title__mainTitle', '[data-testid="x-item-title"]', '#itemTitle',
+        '.x-price-primary', '[data-testid="x-price-primary"]', '#prcIsum',
+        '.ux-labels-values', '#vi-desc-maincntr', '.x-item-condition-value',
+        '[itemprop="price"]', 'meta[property="og:title"]', '#desc_ifr',
+    )
 
-        These pages return HTTP 200 but carry no listing content, which used
-        to surface as a storm of empty fields and the misleading "the listing
-        may have ended". Marker text is the fast path; the structural check
-        below catches localized or reworded challenge pages that no marker
-        list will ever fully cover.
+    def _looks_like_bot_page(self, soup: BeautifulSoup) -> str:
+        """Return why a page looks like a bot-check, or '' if it looks real.
+
+        Returning the reason rather than a bare bool matters for support: the
+        log now says which rule fired, so a false positive can be told from a
+        genuine challenge without guessing.
+
+        Marker text is the fast path. The structural rule is deliberately
+        conservative — it needs *every* listing marker to be absent *and* no
+        eBay-hosted image anywhere on the page — because wrongly classifying
+        a real listing as a block would silently skip good data.
         """
         try:
             text = soup.get_text(" ", strip=True).lower()
             head = text[:5000]
-            if any(marker in head for marker in self.BOT_PAGE_MARKERS):
-                return True
-            # A "page" with almost no text and no heading is an interstitial
-            # or an error shell, not a listing.
+            for marker in self.BOT_PAGE_MARKERS:
+                if marker in head:
+                    return f"challenge text: {marker!r}"
+
             if len(text) < 400 and not soup.select_one('h1'):
-                return True
-            # A real listing always carries an item-scoped element. A page
-            # without any of them, and without a single eBay image, is a
-            # challenge or redirect shell no matter how much boilerplate text
-            # it contains.
-            listing_markers = soup.select_one(
-                'h1.x-item-title__mainTitle, [data-testid="x-item-title"], '
-                '#itemTitle, .x-price-primary, [data-testid="x-price-primary"], '
-                '.ux-labels-values, #vi-desc-maincntr'
+                return "empty shell: under 400 chars and no heading"
+
+            if soup.select_one(', '.join(self.LISTING_MARKERS)) is not None:
+                return ''
+
+            has_item_image = any(
+                'ebayimg.com' in (img.get('src') or img.get('data-src') or
+                                  img.get('data-srcset') or '')
+                for img in soup.find_all('img')
             )
-            if listing_markers is None:
-                has_item_image = any(
-                    'i.ebayimg.com' in (img.get('src') or img.get('data-src') or '')
-                    for img in soup.find_all('img', limit=40)
-                )
-                if not has_item_image:
-                    return True
-        except Exception:
-            pass
-        return False
+            if not has_item_image:
+                return "no listing element and no eBay-hosted image"
+        except Exception as e:
+            logger.debug(f"Bot-page check failed: {e}")
+        return ''
+
+    def save_blocked_page(self, url: str, html: bytes) -> Optional[Path]:
+        """Write a page classified as a bot-check to `blocked_pages/`.
+
+        Without this there is no way to tell a genuine eBay challenge from a
+        detection false positive — both look identical from the log. Keeping
+        the actual HTML makes that question answerable in seconds. Old
+        captures are pruned so the folder cannot grow without bound.
+        """
+        try:
+            folder = Path.cwd() / BLOCKED_PAGES_DIR
+            folder.mkdir(parents=True, exist_ok=True)
+
+            existing = sorted(folder.glob('blocked_*.html'), key=lambda p: p.stat().st_mtime)
+            for stale in existing[:max(0, len(existing) - BLOCKED_PAGES_KEEP + 1)]:
+                stale.unlink(missing_ok=True)
+
+            item_id = self.extract_id_from_url(url) or 'unknown'
+            # Microseconds, not seconds: two listings blocked in the same
+            # second would otherwise overwrite each other's capture.
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            target = folder / f"blocked_{item_id}_{stamp}.html"
+            target.write_bytes(html[:2_000_000])
+            logger.info(f"Saved the blocked page to {target} for diagnosis")
+            return target
+        except OSError as e:
+            logger.debug(f"Could not save the blocked page: {e}")
+            return None
 
     BLOCKED_MESSAGE = (
         "eBay refused the request (anti-bot check). This is rate limiting, not a "
@@ -2033,16 +2169,24 @@ class EbayScraper:
         except Exception as e:
             return ScrapingResult(success=False, error_message=f"Invalid URL: {e}")
 
+        with self._fetch_lock:
+            return self._scrape_product_locked(url, max_attempts)
+
+    def _scrape_product_locked(self, url: str, max_attempts: int) -> ScrapingResult:
         last_error = "Unknown error"
         blocked = False
 
         for attempt in range(1, max_attempts + 1):
             try:
                 if attempt > 1:
-                    # eBay flagged the previous fingerprint — swap identity and
-                    # back off before retrying. A block earns a longer wait
-                    # than a parsing miss.
-                    self.refresh_identity()
+                    # Rotate identity once. A second rotation is pointless: if
+                    # a fresh session and User-Agent did not clear the block,
+                    # the decision is being made on the IP, and rebuilding the
+                    # session again only doubles the traffic (each rebuild
+                    # also re-runs the homepage warm-up) against an edge that
+                    # is already refusing us. Past that, only waiting helps.
+                    if attempt == 2:
+                        self.refresh_identity()
                     base = 6 if blocked else 2
                     time.sleep(min(base ** attempt, 30) + random.uniform(0.5, 2.0))
                 else:
@@ -2079,17 +2223,23 @@ class EbayScraper:
                     continue
 
                 # Parse HTML
-                soup = BeautifulSoup(response_content(outcome.response), 'html.parser')
+                body = response_content(outcome.response)
+                soup = BeautifulSoup(body, 'html.parser')
 
                 # Check for blocked/captcha/interstitial pages
-                if self._looks_like_bot_page(soup):
+                block_reason = self._looks_like_bot_page(soup)
+                if block_reason:
                     blocked = True
                     self.consecutive_blocks += 1
                     last_error = self.BLOCKED_MESSAGE
                     logger.warning(
                         f"Bot-check page served for {url} "
-                        f"(attempt {attempt}/{max_attempts}); retrying with a fresh identity"
+                        f"(attempt {attempt}/{max_attempts}) — {block_reason}"
                     )
+                    if attempt == 1:
+                        # Keep one copy per listing, from the first attempt,
+                        # so the classification can be checked afterwards.
+                        self.save_blocked_page(url, body)
                     continue
 
                 # Extract data
@@ -3825,6 +3975,9 @@ def process_batch_rows(df: pd.DataFrame, row_indices: List[int], scraper: "EbayS
         ledger_register(run_ledger, j_serial, batch_link_key(j_link, scraper),
                         {'serial': j_serial, 'link': j_link, 'when': '', 'file': source_file})
 
+    consecutive_blocked_rows = 0
+    aborted = False
+
     for pos, i in enumerate(row_indices, start=1):
         serial = normalize_serial(df.iat[i, SERIAL_COL])
         brand = str(df.iat[i, BRAND_COL]).strip() if df.shape[1] > BRAND_COL else ''
@@ -3892,6 +4045,9 @@ def process_batch_rows(df: pd.DataFrame, row_indices: List[int], scraper: "EbayS
                 stats['error'] += 1
                 if 'anti-bot' in message or 'refused the request' in message:
                     stats['blocked'] += 1
+                    consecutive_blocked_rows += 1
+                else:
+                    consecutive_blocked_rows = 0
                 append_batch_status({**record, 'Status': STATUS_ERROR, 'Details': message})
         except ValidationError as ve:
             df.iat[i, STATUS_COL] = STATUS_ERROR
@@ -3912,6 +4068,19 @@ def process_batch_rows(df: pd.DataFrame, row_indices: List[int], scraper: "EbayS
             progress.progress(pos / total)
             if metrics_slot is not None and table_slot is not None:
                 render_queue_view(df, notes, metrics_slot, table_slot)
+
+            if consecutive_blocked_rows >= MAX_CONSECUTIVE_BLOCKED_ROWS:
+                # Every remaining row would fail the same way. Stopping keeps
+                # the rest of the file `pending` so Retry picks up exactly
+                # where this left off, instead of marking 40 good links as
+                # errors and forcing the user to sort them out afterwards.
+                aborted = True
+                logger.warning(
+                    f"Stopping the batch after {consecutive_blocked_rows} consecutive blocked "
+                    f"listings; {total - pos} row(s) left untouched."
+                )
+                break
+
             if pos < total and normalize_status(df.iat[i, STATUS_COL]) != STATUS_DUPLICATE:
                 # Pause between listings that actually hit the network. The
                 # delay grows while eBay is blocking us, which is what stops a
@@ -3926,7 +4095,11 @@ def process_batch_rows(df: pd.DataFrame, row_indices: List[int], scraper: "EbayS
                 time.sleep(delay)
 
     summary = f"{stats['done']} done, {stats['duplicate']} duplicate, {stats['error']} failed"
-    status_box.success(f"Batch finished — {summary}.")
+    if aborted:
+        remaining = len(row_indices) - stats['done'] - stats['error'] - stats['duplicate']
+        status_box.error(f"Batch stopped early — {summary}, {remaining} not attempted.")
+    else:
+        status_box.success(f"Batch finished — {summary}.")
     # Stash outcome messages in session state: the caller reruns the page
     # right after this returns, which would wipe anything rendered here.
     st.session_state.batch_last_run = f"Last run: {summary}."
@@ -3934,8 +4107,11 @@ def process_batch_rows(df: pd.DataFrame, row_indices: List[int], scraper: "EbayS
         st.session_state.batch_persist_warning = True
     if stats['blocked']:
         # Retrying straight away just reproduces the block, which is what
-        # makes the retry button look broken.
+        # makes the retry button look broken. Record when it is worth trying
+        # again so the UI can hold the button until then.
         st.session_state.batch_blocked_count = stats['blocked']
+        st.session_state.batch_aborted = aborted
+        st.session_state.batch_retry_after = time.time() + BLOCK_COOLDOWN_MINUTES * 60
     return stats
 
 
@@ -4006,12 +4182,26 @@ def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> Non
         st.success(last_run)
     blocked_count = st.session_state.pop('batch_blocked_count', 0)
     if blocked_count:
+        aborted = st.session_state.pop('batch_aborted', False)
+        lead = (f"Stopped after {MAX_CONSECUTIVE_BLOCKED_ROWS} listings in a row were blocked. "
+                "The rows that were never attempted are still `pending`, so Retry continues "
+                "from where it stopped."
+                if aborted else
+                f"{blocked_count} row(s) were blocked by eBay.")
         st.warning(
-            f"{blocked_count} row(s) failed because eBay refused the request (anti-bot check), "
-            "not because the links are wrong. eBay throttles bursts from one IP address. "
-            "**Wait 10-15 minutes, then press Retry failed** — retrying immediately usually "
-            "hits the same block. Each run now slows itself down automatically after a block."
+            f"{lead}\n\neBay refused these requests with an anti-bot check — **the links are "
+            "fine**. This is throttling of one IP address. Waiting is the only thing that "
+            "clears it; retrying straight away hits the same block."
         )
+        if not CURL_CFFI_AVAILABLE:
+            st.info(
+                "**This is worth doing once:** install `curl_cffi` and eBay sees a real "
+                "browser's TLS fingerprint instead of Python's.\n\n"
+                "```\npip install curl_cffi\n```\n\n"
+                "Restart the app afterwards. Right now the requests claim to be Chrome in "
+                "their headers while the TLS handshake says Python — that mismatch is one of "
+                "the easiest things for eBay's edge to flag."
+            )
 
     # --- Upload ---
     uploaded_file = st.file_uploader(
@@ -4113,9 +4303,21 @@ def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> Non
             disabled=n_pending == 0, width='stretch',
         )
     with col_b:
-        retry_clicked = st.button(
-            f"Retry {n_error} failed", disabled=n_error == 0, width='stretch',
-        )
+        # Hold Retry shut while eBay is still likely to be blocking us.
+        # Letting the user re-trigger it immediately just reproduces the
+        # block and burns another few minutes for nothing.
+        retry_after = float(st.session_state.get('batch_retry_after') or 0)
+        seconds_left = max(0, int(retry_after - time.time()))
+        if seconds_left:
+            retry_clicked = False
+            st.button(f"Retry in {seconds_left // 60}m {seconds_left % 60:02d}s",
+                      disabled=True, width='stretch',
+                      help="eBay was blocking this run. Waiting is what clears it.")
+        else:
+            st.session_state.pop('batch_retry_after', None)
+            retry_clicked = st.button(
+                f"Retry {n_error} failed", disabled=n_error == 0, width='stretch',
+            )
     with col_c:
         try:
             payload, fname, mime = build_batch_download(
@@ -5843,6 +6045,13 @@ def render_sidebar() -> str:
             st.caption("AI features enabled.")
         else:
             st.caption("AI features need a key.")
+
+        st.markdown('<div class="es-side-section">Scraping</div>', unsafe_allow_html=True)
+        if CURL_CFFI_AVAILABLE:
+            st.caption("Browser TLS fingerprint active (curl_cffi).")
+        else:
+            st.caption("Basic TLS (requests). `pip install curl_cffi` to look like a real "
+                       "browser and get blocked far less often.")
 
         st.markdown('<div class="es-side-section">Files</div>', unsafe_allow_html=True)
         st.caption(f"Products: `EbayStore_Products.csv`\n\nHistory: `{BATCH_STATUS_LOG.name}`")

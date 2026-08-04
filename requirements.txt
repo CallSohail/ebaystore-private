@@ -4,6 +4,13 @@ beautifulsoup4>=4.12.0
 pandas>=2.2.0
 Pillow>=10.2.0
 groq>=0.4.2
-rembg>=2.0.50
 openpyxl>=3.1.2
 tenacity>=8.2.3
+
+# Strongly recommended for scraping. eBay's edge fingerprints the TLS
+# handshake, and plain `requests` produces one that matches no real browser —
+# so a request claiming to be Chrome in its User-Agent contradicts itself at
+# the TLS layer. curl_cffi replays a real browser's fingerprint so the two
+# agree, which is the difference between most listings being blocked and most
+# going through. The app runs without it and falls back to `requests`.
+curl_cffi>=0.7.0
