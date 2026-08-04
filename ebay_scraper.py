@@ -27,6 +27,7 @@ import os
 import random
 import re
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -619,15 +620,51 @@ class DataExtractionError(ScrapingError):
 class AIServiceError(Exception):
     """An AI request failed for a reason the user can act on.
 
-    Carries a message that is already safe and useful to show in the UI, so
-    callers can render `str(exc)` directly instead of a raw stack trace.
+    Carries a message that is already safe to render in the UI, plus a `kind`
+    so callers can branch on it — a bulk run stops immediately on a spent
+    quota or a rejected key, but keeps going past a single oversized source.
     """
-    pass
+
+    def __init__(self, message: str, kind: str = 'error'):
+        super().__init__(message)
+        self.kind = kind
+
+
+# Kinds that make continuing a bulk run pointless: every remaining request
+# would fail the same way.
+AI_FATAL_KINDS = {'quota', 'rate_limit', 'auth', 'model'}
 
 
 # Groq surfaces failures as HTTP status codes plus a JSON error body. The
 # status alone is ambiguous (429 covers both "too many requests per minute"
 # and "daily token budget spent"), so the body text is inspected as well.
+def classify_ai_error(exc: BaseException) -> str:
+    """Bucket a Groq exception: quota, rate_limit, auth, model, too_long, ..."""
+    status = getattr(exc, 'status_code', None)
+    if status is None:
+        status = getattr(getattr(exc, 'response', None), 'status_code', None)
+    low = str(exc).lower()
+
+    if status == 429 or 'rate_limit' in low or 'rate limit' in low or 'quota' in low:
+        if 'tokens per day' in low or 'tpd' in low or 'per day' in low or 'daily' in low:
+            return 'quota'
+        return 'rate_limit'
+    if status in (401, 403) or 'invalid_api_key' in low or 'invalid api key' in low or 'unauthorized' in low:
+        return 'auth'
+    if status == 404 or 'model_not_found' in low or 'does not exist' in low or 'decommissioned' in low:
+        return 'model'
+    if status == 413 or 'context_length' in low or 'too large' in low or 'reduce the length' in low:
+        return 'too_long'
+    if status in (500, 502, 503, 504) or 'service unavailable' in low or 'overloaded' in low:
+        return 'unavailable'
+    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)) \
+            or 'connection' in low or 'timed out' in low or 'timeout' in low:
+        return 'network'
+    if status == 400 or 'invalid_request' in low:
+        return 'bad_request'
+    return 'error'
+
+
 def describe_ai_error(exc: BaseException) -> str:
     """Translate an exception from the Groq client into a plain-language cause.
 
@@ -635,10 +672,7 @@ def describe_ai_error(exc: BaseException) -> str:
     used your free daily allowance" and not "Error code: 429 -
     {'error': {'message': ...}}".
     """
-    status = getattr(exc, 'status_code', None)
-    if status is None:
-        response = getattr(exc, 'response', None)
-        status = getattr(response, 'status_code', None)
+    kind = classify_ai_error(exc)
     text = str(exc)
     low = text.lower()
 
@@ -648,35 +682,34 @@ def describe_ai_error(exc: BaseException) -> str:
     if match:
         retry_hint = f" Try again in {match.group(1)}."
 
-    if status == 429 or 'rate_limit' in low or 'rate limit' in low or 'quota' in low:
-        if 'tokens per day' in low or 'tpd' in low or 'daily' in low:
-            return ("Groq daily token allowance used up. The quota resets every 24 hours — "
-                    "wait for the reset or upgrade the Groq plan for this API key." + retry_hint)
+    if kind == 'quota':
+        return ("Groq daily token allowance used up. The quota resets every 24 hours — "
+                "wait for the reset or upgrade the Groq plan for this API key." + retry_hint)
+    if kind == 'rate_limit':
         return ("Groq rate limit reached — too many requests in a short window. "
                 "Wait a moment and run it again." + retry_hint)
-    if status in (401, 403) or 'invalid_api_key' in low or 'invalid api key' in low or 'unauthorized' in low:
+    if kind == 'auth':
         return ("The Groq API key was rejected. Check it in the sidebar — keys start with "
                 "'gsk_' and can be regenerated at console.groq.com/keys.")
-    if status == 404 or 'model_not_found' in low or 'does not exist' in low or 'decommissioned' in low:
+    if kind == 'model':
         return ("The configured Groq model is unavailable or has been retired. "
                 "Pick a current model at console.groq.com/docs/models.")
-    if status == 413 or 'context_length' in low or 'too large' in low or 'reduce the length' in low:
+    if kind == 'too_long':
         return ("The source text is too long for the model's context window. "
                 "Use a shorter source file or trim the custom instructions.")
-    if status == 400 or 'invalid_request' in low:
-        return f"Groq rejected the request: {text[:200]}"
-    if status in (500, 502, 503, 504) or 'service unavailable' in low or 'overloaded' in low:
+    if kind == 'unavailable':
         return "Groq is temporarily unavailable or overloaded. Wait a minute and try again."
-    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)) \
-            or 'connection' in low or 'timed out' in low or 'timeout' in low:
+    if kind == 'network':
         return "Could not reach Groq. Check the internet connection and try again."
+    if kind == 'bad_request':
+        return f"Groq rejected the request: {text[:200]}"
     return f"AI request failed: {text[:200]}"
 
 
 def raise_ai_error(exc: BaseException) -> None:
     """Log the raw failure and re-raise it as a user-facing AIServiceError."""
     logger.error(f"AI request failed: {exc}")
-    raise AIServiceError(describe_ai_error(exc)) from exc
+    raise AIServiceError(describe_ai_error(exc), classify_ai_error(exc)) from exc
 
 
 # =============================================================================
@@ -988,19 +1021,21 @@ class EbayScraper:
             
             product_data.price = self._extract_price(soup, price_selectors)
             
-            # Extract condition
-            condition_selectors = [
-                '[data-testid="u-flL condText"] span',
-                '.x-item-condition-text',
+            # Extract condition. The current layout puts it in a labelled
+            # summary row, so try that first and fall back to the older
+            # standalone elements.
+            product_data.condition = self._extract_labeled_value(
+                soup, ['condition'], ['condition'], 'condition'
+            ) or self._extract_text_by_selectors(soup, [
+                '.x-item-condition-value .ux-textspans',
+                '.x-item-condition-max-view .ux-section__item',
                 '[data-testid="x-item-condition"] span',
+                '.x-item-condition-text',
                 '#vi-itm-cond',
                 '.vi-itm-cond',
                 '.d-item-condition',
-                '.ux-textspans--BOLD[class*="cond"]'
-            ]
-            
-            product_data.condition = self._extract_text_by_selectors(soup, condition_selectors, "condition")
-            
+            ], "condition")
+
             # Extract seller information
             seller_selectors = [
                 '[data-testid="str-title"] a',
@@ -1013,13 +1048,15 @@ class EbayScraper:
             product_data.seller = self._extract_text_by_selectors(soup, seller_selectors, "seller")
             
             # Extract shipping information
-            shipping_selectors = [
+            product_data.shipping = self._extract_labeled_value(
+                soup, ['shipping', 'delivery'],
+                ['shipping', 'delivery', 'postage'], 'shipping'
+            ) or self._extract_text_by_selectors(soup, [
+                '[data-testid="ux-labels-values"] .ux-textspans--BOLD',
                 '[data-testid="vi-price-ship"]',
                 '#fshippingCost',
-                '#shSummary'
-            ]
-            
-            product_data.shipping = self._extract_text_by_selectors(soup, shipping_selectors, "shipping")
+                '#shSummary',
+            ], "shipping")
             
             # Extract brand and item specifics
             product_data.item_specifics = self._extract_item_specifics(soup)
@@ -1029,13 +1066,21 @@ class EbayScraper:
             product_data.description = self._extract_description(soup, url)
 
             # Additional fields for richer AI prompts
-            product_data.location = self._extract_text_by_selectors(soup, [
-                '#itemLocation', '.item-location', '[data-testid="ux-seller-location"]',
-                '.ux-seller-section__itemLocation'] , "location")
-            product_data.returns_policy = self._extract_text_by_selectors(soup, [
-                '#vi-ret-accrd-txt', '.x-ret-accrd-txt', '.returns-policy'] , "returns")
-            product_data.category = self._extract_text_by_selectors(soup, [
-                '#vi-VR-brumb-lnkLst', '.bc-w', 'nav[aria-label="Breadcrumbs"]'] , "category")
+            product_data.location = self._extract_labeled_value(
+                soup, ['itemLocation', 'location'],
+                ['located in', 'item location', 'location', 'ships from'], 'location'
+            ) or self._extract_text_by_selectors(soup, [
+                '#itemLocation', '.item-location',
+                '[data-testid="ux-seller-location"]', '.ux-seller-section__itemLocation',
+            ], "location")
+
+            product_data.returns_policy = self._extract_labeled_value(
+                soup, ['returns'], ['returns', 'return policy'], 'returns'
+            ) or self._extract_text_by_selectors(soup, [
+                '#vi-ret-accrd-txt', '.x-ret-accrd-txt', '.returns-policy',
+            ], "returns")
+
+            product_data.category = self._extract_breadcrumbs(soup)
             # Try to parse item id from URL or page
             product_data.item_id = self.extract_id_from_url(url)
             
@@ -1148,6 +1193,103 @@ class EbayScraper:
         logger.debug(f"No {field_name} found using any selector")
         return ""
     
+    # eBay renders most of the summary panel as label/value rows. The class
+    # modifier (ux-labels-values--condition) is the fast path; the visible
+    # label text is the durable fallback, because eBay reshuffles class names
+    # far more often than it renames the labels a buyer reads.
+    LABEL_ROW_VALUE = '.ux-labels-values__values'
+
+    def _extract_labeled_value(self, soup: BeautifulSoup, modifiers: List[str],
+                               labels: List[str], field_name: str) -> str:
+        """Read a value from an eBay label/value row, by class then by label text."""
+        for modifier in modifiers:
+            try:
+                for row in soup.select(f'[class*="ux-labels-values--{modifier}"]'):
+                    value_node = row.select_one(self.LABEL_ROW_VALUE)
+                    text = self._get_clean_text(value_node) if value_node else ''
+                    if text:
+                        logger.debug(f"Extracted {field_name} from ux-labels-values--{modifier}")
+                        return text
+            except Exception as e:
+                logger.debug(f"Label modifier {modifier} failed for {field_name}: {e}")
+
+        wanted = {label.strip().lower().rstrip(':') for label in labels}
+        try:
+            candidates = soup.find_all(['span', 'div', 'th', 'dt', 'td', 'label'])
+        except Exception:
+            return ''
+
+        for node in candidates:
+            try:
+                text = node.get_text(' ', strip=True).lower().rstrip(':').strip()
+            except Exception:
+                continue
+            if text not in wanted:
+                continue
+            value = self._value_near_label(node)
+            if value:
+                logger.debug(f"Extracted {field_name} by label text '{text}'")
+                return value
+        return ''
+
+    def _value_near_label(self, label_node: Tag, max_levels: int = 4) -> str:
+        """Find the value that belongs to a label node.
+
+        Walks up a few ancestors looking first for eBay's explicit value
+        container, then for the next sibling cell. Anything that just repeats
+        the label is rejected so a row never reports its own heading.
+        """
+        label_text = label_node.get_text(' ', strip=True).lower().rstrip(':').strip()
+        node: Optional[Tag] = label_node
+        for _ in range(max_levels):
+            if node is None:
+                break
+            parent = node.parent
+            if parent is None:
+                break
+            try:
+                value_node = parent.select_one(self.LABEL_ROW_VALUE)
+            except Exception:
+                value_node = None
+            if value_node is not None:
+                text = self._get_clean_text(value_node)
+                if text and text.lower().rstrip(':').strip() != label_text:
+                    return text
+            sibling = node.find_next_sibling()
+            while sibling is not None:
+                if isinstance(sibling, Tag):
+                    text = self._get_clean_text(sibling)
+                    if text and text.lower().rstrip(':').strip() != label_text:
+                        return text
+                sibling = sibling.find_next_sibling()
+            node = parent
+        return ''
+
+    def _extract_breadcrumbs(self, soup: BeautifulSoup) -> str:
+        """Category path, joined with ' > '."""
+        selectors = [
+            'nav[aria-label*="readcrumb" i]',
+            '.seo-breadcrumb-text',
+            '#vi-VR-brumb-lnkLst',
+            '.breadcrumbs',
+            '.bc-w',
+        ]
+        for selector in selectors:
+            try:
+                nav = soup.select_one(selector)
+            except Exception:
+                continue
+            if nav is None:
+                continue
+            parts = [a.get_text(' ', strip=True) for a in nav.select('a')]
+            if not parts:
+                parts = [li.get_text(' ', strip=True) for li in nav.select('li')]
+            cleaned = [p for p in dict.fromkeys(parts)
+                       if p and p.lower() not in ('ebay', 'back to home page')]
+            if cleaned:
+                return " > ".join(cleaned[:8])
+        return ''
+
     def _extract_price(self, soup: BeautifulSoup, selectors: List[str]) -> str:
         """Extract price with currency symbol validation."""
         currency_symbols = ['$', '£', '€', '¥', '₹', 'CAD', 'USD', 'GBP', 'EUR']
@@ -2279,21 +2421,15 @@ class FileManager:
             image.save(output_path)
 
     def list_image_folders(self) -> List[Path]:
-        """List subfolders under base_dir that contain at least one image."""
-        folders: List[Path] = []
-        try:
-            for p in self.base_dir.iterdir():
-                if p.is_dir():
-                    if any((p / f).suffix.lower() in {'.jpg', '.jpeg', '.png', '.webp'} for f in os.listdir(p)):
-                        folders.append(p)
-        except Exception:
-            pass
-        return sorted(folders, key=lambda x: x.name.lower())
+        """Folders under base_dir that contain at least one image (cached)."""
+        return [Path(p) for p in scan_image_folders(str(self.base_dir), data_version())]
 
     def list_images(self, folder_path: Path) -> List[Path]:
         try:
-            return [p for p in folder_path.iterdir() if p.suffix.lower() in {'.jpg', '.jpeg', '.png', '.webp'}]
-        except Exception:
+            return sorted((p for p in folder_path.iterdir()
+                           if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES),
+                          key=lambda p: p.name.lower())
+        except OSError:
             return []
     
     def create_product_folder(self, brand: str, item_id: str = "", fallback_title: str = "") -> Path:
@@ -2502,36 +2638,13 @@ class FileManager:
             logger.error(f"Error downloading images: {e}")
             return downloaded_paths
     
-    def get_existing_product_folders(self) -> List[Dict[str, str]]:
+    def get_existing_product_folders(self) -> List[Dict[str, Any]]:
+        """Product folders holding scraped text, with file lists and counts.
+
+        Backed by a cached directory scan, so calling this several times in
+        one render (the AI tab does) costs nothing after the first call.
         """
-        Get list of existing product folders for AI processing.
-        
-        Returns:
-            List of dictionaries with folder info
-        """
-        try:
-            folders = []
-            for folder_path in self.base_dir.iterdir():
-                if folder_path.is_dir():
-                    # Look for text-like files in folder (.txt, .md)
-                    text_files = list(folder_path.glob("*.txt")) + list(folder_path.glob("*.md"))
-                    if text_files:
-                        # Exclude AI-processed files from main list
-                        main_files = [f for f in text_files if not f.name.startswith("ai_")]
-                        if main_files:
-                            folders.append({
-                                'folder_name': folder_path.name,
-                                'folder_path': str(folder_path),
-                                'text_files': [f.name for f in main_files],
-                                'main_file': main_files[0].name if main_files else ""
-                            })
-            
-            logger.debug(f"Found {len(folders)} product folders")
-            return sorted(folders, key=lambda x: x['folder_name'])
-            
-        except Exception as e:
-            logger.error(f"Error getting product folders: {e}")
-            return []
+        return scan_product_folders(str(self.base_dir), data_version())
     
     def load_product_text(self, folder_path: str, filename: str) -> str:
         """
@@ -2595,6 +2708,184 @@ def save_groq_api_key(api_key: str) -> bool:
     except Exception as e:
         logger.error(f"Failed to save Groq API key: {e}")
         return False
+
+
+# =============================================================================
+# CACHING
+# =============================================================================
+#
+# Streamlit re-runs the whole script on every widget interaction. Without
+# caching, each click re-walked the downloads tree, re-read the history CSV
+# and re-read the log file — which is what made the app feel like it hung
+# once a few hundred images had been downloaded.
+#
+# Two invalidation strategies are used, both cheap and both correct:
+#
+#   * File-backed reads are keyed on (path, mtime, size). The moment the file
+#     changes on disk the key changes, so there is no staleness window.
+#   * Directory scans are keyed on a version counter that is bumped whenever
+#     the app writes into the downloads tree, with a short TTL as a backstop
+#     for changes made outside the app (e.g. the user deleting a folder).
+
+DIR_CACHE_TTL = 30       # seconds; backstop for out-of-band filesystem changes
+FILE_CACHE_TTL = 300     # file reads are keyed on mtime, so this is just a cap
+
+
+def bump_data_version() -> None:
+    """Invalidate cached directory scans after the app writes to disk."""
+    try:
+        st.session_state['_data_version'] = st.session_state.get('_data_version', 0) + 1
+        # A prepared export no longer reflects what is on disk.
+        st.session_state.pop('zip_payload', None)
+    except Exception:
+        # Called from a non-Streamlit context (tests); nothing to invalidate.
+        pass
+
+
+def data_version() -> int:
+    try:
+        return st.session_state.get('_data_version', 0)
+    except Exception:
+        return 0
+
+
+def _stat_key(path: Path) -> Tuple[str, float, int]:
+    """(path, mtime, size) cache key. Missing files get a stable zero key."""
+    try:
+        stat = path.stat()
+        return (str(path), stat.st_mtime, stat.st_size)
+    except OSError:
+        return (str(path), 0.0, 0)
+
+
+IMAGE_SUFFIXES = {'.jpg', '.jpeg', '.png', '.webp'}
+
+
+@st.cache_data(ttl=DIR_CACHE_TTL, show_spinner=False)
+def scan_product_folders(base_dir: str, version: int) -> List[Dict[str, Any]]:
+    """Folders under base_dir holding scraped text, with their files and counts."""
+    base = Path(base_dir)
+    folders: List[Dict[str, Any]] = []
+    try:
+        entries = sorted(base.iterdir(), key=lambda p: p.name.lower())
+    except OSError:
+        return folders
+
+    for folder in entries:
+        if not folder.is_dir():
+            continue
+        try:
+            children = list(folder.iterdir())
+        except OSError:
+            continue
+        listings = [f.name for f in children if f.name.endswith('_listing.txt')]
+        # Generated output is never a source: feeding a listing back into the
+        # generator would rewrite the model's own text instead of the scrape.
+        text_files = [f.name for f in children
+                      if f.suffix.lower() in ('.txt', '.md')
+                      and not f.name.startswith('ai_')
+                      and f.name not in listings]
+        if not text_files:
+            continue
+        images = [f.name for f in children if f.suffix.lower() in IMAGE_SUFFIXES]
+        folders.append({
+            'folder_name': folder.name,
+            'folder_path': str(folder),
+            'text_files': sorted(text_files),
+            'main_file': sorted(text_files)[0],
+            'image_count': len(images),
+            'listing_files': sorted(listings),
+        })
+    return folders
+
+
+@st.cache_data(ttl=DIR_CACHE_TTL, show_spinner=False)
+def scan_image_folders(base_dir: str, version: int) -> List[str]:
+    """Folders (including base_dir itself) that contain at least one image."""
+    base = Path(base_dir)
+    found: List[str] = []
+    try:
+        if any(p.suffix.lower() in IMAGE_SUFFIXES for p in base.iterdir() if p.is_file()):
+            found.append(str(base))
+        for folder in sorted(base.iterdir(), key=lambda p: p.name.lower()):
+            if not folder.is_dir():
+                continue
+            try:
+                if any(p.suffix.lower() in IMAGE_SUFFIXES for p in folder.iterdir() if p.is_file()):
+                    found.append(str(folder))
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return found
+
+
+@st.cache_data(ttl=DIR_CACHE_TTL, show_spinner=False)
+def scan_webp_folders(base_dir: str, version: int) -> List[Tuple[str, int]]:
+    """(folder, webp_count) for every folder in the tree holding .webp files.
+
+    One recursive walk produces both the folder list and the counts; the
+    previous version walked the tree once and then re-listed every folder
+    again just to label the dropdown.
+    """
+    base = Path(base_dir)
+    results: List[Tuple[str, int]] = []
+    if not base.exists():
+        return results
+
+    def webp_count(folder: Path) -> int:
+        try:
+            return sum(1 for c in folder.iterdir()
+                       if c.is_file() and c.suffix.lower() == '.webp')
+        except OSError:
+            return 0
+
+    count = webp_count(base)
+    if count:
+        results.append((str(base), count))
+    try:
+        for path in base.rglob('*'):
+            if path.is_dir():
+                count = webp_count(path)
+                if count:
+                    results.append((str(path), count))
+    except OSError:
+        pass
+    return sorted(results, key=lambda item: item[0].lower())
+
+
+@st.cache_data(ttl=FILE_CACHE_TTL, show_spinner=False)
+def _read_status_log(key: Tuple[str, float, int]) -> pd.DataFrame:
+    """Parse batch_status_log.csv. Keyed on the file's stat, never on content."""
+    path = Path(key[0])
+    empty = pd.DataFrame(columns=BATCH_LOG_COLUMNS)
+    if key[2] == 0:
+        return empty
+    try:
+        df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding='utf-8-sig')
+    except Exception as e:
+        logger.warning(f"Could not read {path.name}: {e}")
+        return empty
+    # Tolerate a log written by an older version with fewer columns
+    for column in BATCH_LOG_COLUMNS:
+        if column not in df.columns:
+            df[column] = ''
+    return df[BATCH_LOG_COLUMNS]
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def read_log_tail(key: Tuple[str, float, int], tail: int) -> str:
+    """Last `tail` lines of the application log."""
+    path = Path(key[0])
+    if key[2] == 0:
+        return ''
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            return "".join(f.readlines()[-tail:])
+    except OSError as e:
+        logger.warning(f"Could not read {path.name}: {e}")
+        return ''
+
 
 # =============================================================================
 # BATCH PROCESSING (CSV/Excel driven)
@@ -2733,21 +3024,12 @@ def append_batch_status(record: Dict[str, Any]) -> bool:
 
 
 def load_batch_status_log() -> pd.DataFrame:
-    """Read batch_status_log.csv. Returns an empty frame when absent/unreadable."""
-    empty = pd.DataFrame(columns=BATCH_LOG_COLUMNS)
-    try:
-        if not BATCH_STATUS_LOG.exists() or BATCH_STATUS_LOG.stat().st_size == 0:
-            return empty
-        df = pd.read_csv(BATCH_STATUS_LOG, dtype=str, keep_default_na=False,
-                         encoding='utf-8-sig')
-        # Tolerate a log written by an older version with fewer columns
-        for col in BATCH_LOG_COLUMNS:
-            if col not in df.columns:
-                df[col] = ''
-        return df
-    except Exception as e:
-        logger.warning(f"Could not read {BATCH_STATUS_LOG.name}: {e}")
-        return empty
+    """Read batch_status_log.csv. Returns an empty frame when absent/unreadable.
+
+    Parsing is cached against the file's mtime and size, so repeated reruns
+    cost a stat() rather than a full CSV parse.
+    """
+    return _read_status_log(_stat_key(BATCH_STATUS_LOG))
 
 
 def clear_batch_status_log() -> bool:
@@ -3072,6 +3354,17 @@ def _atomic_write(path: Path, data: bytes, attempts: int = 4) -> bool:
             return True
         except OSError as e:
             last_err = e
+            # On Windows a read-only attribute on the target makes os.replace
+            # fail with EACCES even when no process holds the file open, and
+            # the app otherwise looks broken while every other write succeeds.
+            # Clearing the flag between attempts recovers that case; a genuine
+            # lock (the CSV open in Excel) still falls through to the retry.
+            try:
+                if path.exists() and not os.access(path, os.W_OK):
+                    os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+                    logger.info(f"Cleared the read-only attribute on {path.name}")
+            except OSError:
+                pass
             time.sleep(0.3 * (attempt + 1))
     try:
         if tmp.exists():
@@ -3080,7 +3373,7 @@ def _atomic_write(path: Path, data: bytes, attempts: int = 4) -> bool:
         pass
     logger.error(
         f"Could not write {path.name} after {attempts} attempts: {last_err}. "
-        "If the file is open in Excel or another program, close it there."
+        "The file is most likely open in Excel or another program — close it there."
     )
     return False
 
@@ -3257,6 +3550,7 @@ def process_batch_rows(df: pd.DataFrame, row_indices: List[int], scraper: "EbayS
                         # Images are best-effort; the scraped data is already saved.
                         logger.warning(f"Image download failed for S.NO {serial}: {img_err}")
                 append_to_local_csv(result.product_data)
+                bump_data_version()
                 df.iat[i, STATUS_COL] = STATUS_DONE
                 notes.pop(str(i), None)
                 stats['done'] += 1
@@ -3567,31 +3861,6 @@ WEBP_TARGET_FORMATS = {
 }
 
 
-def list_folders_with_webp(base_dir: Path) -> List[Path]:
-    """Return subfolders of base_dir (recursive, depth-1 then nested) that contain .webp files."""
-    results: List[Path] = []
-    if not base_dir.exists():
-        return results
-    seen: set = set()
-
-    def has_webp(p: Path) -> bool:
-        try:
-            return any(child.is_file() and child.suffix.lower() == '.webp' for child in p.iterdir())
-        except Exception:
-            return False
-
-    if has_webp(base_dir) and base_dir not in seen:
-        results.append(base_dir)
-        seen.add(base_dir)
-
-    for path in base_dir.rglob('*'):
-        if path.is_dir() and path not in seen and has_webp(path):
-            results.append(path)
-            seen.add(path)
-
-    return sorted(results, key=lambda p: str(p).lower())
-
-
 def convert_webp_in_folder(folder: Path, target_key: str) -> Tuple[int, int, List[str]]:
     """Convert every .webp in `folder` to target_key format, replacing the original.
 
@@ -3628,50 +3897,45 @@ def render_image_format_tab(file_manager: "FileManager") -> None:
     st.caption("Convert WebP images in a product folder to another format. Originals are replaced.")
 
     base_dir = file_manager.base_dir
-    folders = list_folders_with_webp(base_dir)
+    # One cached walk yields both the folders and their counts.
+    folders = scan_webp_folders(str(base_dir), data_version())
 
     if not folders:
-        st.info(f"No folders containing WebP images found under `{base_dir}`. Scrape some products first.")
+        st.info(f"No WebP images found under `{base_dir}`. Scrape some products first.")
         return
 
-    folder_labels = [f"{p.relative_to(base_dir)} ({sum(1 for c in p.iterdir() if c.is_file() and c.suffix.lower() == '.webp')} webp)"
-                     if p != base_dir else f"(root) ({sum(1 for c in p.iterdir() if c.is_file() and c.suffix.lower() == '.webp')} webp)"
-                     for p in folders]
+    def label(index: int) -> str:
+        folder_str, count = folders[index]
+        folder = Path(folder_str)
+        name = "(root)" if folder == base_dir else str(folder.relative_to(base_dir))
+        return f"{name} — {count} webp"
 
-    col_f, col_t = st.columns([2, 1])
-    with col_f:
-        idx = st.selectbox(
-            "Select folder (only folders with WebP images are listed)",
-            options=list(range(len(folders))),
-            format_func=lambda i: folder_labels[i],
-        )
-    with col_t:
-        target = st.selectbox("Convert to", options=list(WEBP_TARGET_FORMATS.keys()), index=0)
+    col_folder, col_target = st.columns([2, 1])
+    idx = col_folder.selectbox("Folder", options=list(range(len(folders))), format_func=label)
+    target = col_target.selectbox("Convert to", options=list(WEBP_TARGET_FORMATS.keys()))
 
-    selected_folder = folders[idx]
-    webp_files = [p for p in selected_folder.iterdir() if p.is_file() and p.suffix.lower() == '.webp']
-    st.caption(f"Folder: `{selected_folder}` — found **{len(webp_files)}** webp file(s).")
+    selected_folder = Path(folders[idx][0])
+    count = folders[idx][1]
 
-    if webp_files:
-        with st.expander("Preview files to be converted", expanded=False):
-            for wp in webp_files[:50]:
-                st.text(wp.name)
-            if len(webp_files) > 50:
-                st.caption(f"...and {len(webp_files) - 50} more")
-
-    if st.button(f"Convert {len(webp_files)} WebP to {target}", type="primary", disabled=not webp_files):
-        with st.spinner("Converting..."):
+    if st.button(f"Convert {count} file(s) to {target}", type="primary", disabled=not count):
+        with st.spinner(f"Converting {count} image(s)..."):
             converted, failed, errors = convert_webp_in_folder(selected_folder, target)
+        bump_data_version()
         if converted:
-            st.success(f"Converted {converted} image(s) to {target}. Originals removed.")
+            st.session_state.fmt_result = f"Converted {converted} image(s) to {target}. Originals removed."
         if failed:
-            st.error(f"{failed} image(s) failed to convert.")
-            with st.expander("Show errors"):
-                for err in errors:
-                    st.code(err, language=None)
-        if not converted and not failed:
-            st.info("Nothing to convert.")
+            st.session_state.fmt_errors = errors
         st.rerun()
+
+    result = st.session_state.pop('fmt_result', '')
+    if result:
+        st.success(result)
+    errors = st.session_state.pop('fmt_errors', None)
+    if errors:
+        st.error(f"{len(errors)} image(s) could not be converted.")
+        with st.expander("Show errors"):
+            for err in errors:
+                st.code(err, language=None)
 
 
 # =============================================================================
@@ -3815,6 +4079,7 @@ def render_image_enhancement_tab(file_manager: "FileManager") -> None:
             )
             progress_bar.empty()
             status_text.empty()
+            bump_data_version()
             failed = len(selected_paths) - len(processed)
             if processed:
                 st.success(f"Enhanced {len(processed)} image(s) into `{output_root}`.")
@@ -3854,56 +4119,69 @@ def render_logs_tab(tail: int = 200) -> None:
     col_caption, col_refresh = st.columns([4, 1])
     col_caption.caption(f"Last {tail} lines of `{log_filename}`.")
     if col_refresh.button("Refresh", width='stretch'):
+        read_log_tail.clear()
         st.rerun()
 
     log_path = Path(log_filename)
+    if not log_path.exists():
+        st.info("No log file yet — it is created on the first action.")
+        return
+
+    content = read_log_tail(_stat_key(log_path), tail)
+    if not content:
+        st.info("The log file is empty.")
+        return
+
+    st.code(content, language="text")
     try:
-        if not log_path.exists():
-            st.info("No log file yet — it is created on the first action.")
-            return
-        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
-            lines = f.readlines()
-        if not lines:
-            st.info("The log file is empty.")
-            return
-        st.code("".join(lines[-tail:]), language="text")
         st.download_button("Download full log", data=log_path.read_bytes(),
                            file_name=log_path.name, mime='text/plain')
     except PermissionError:
-        st.error(f"`{log_filename}` is locked by another program.")
+        st.caption(f"`{log_filename}` is locked by another program — download unavailable.")
     except OSError as e:
-        st.error(f"Could not read the log file: {e}")
+        st.caption(f"Download unavailable: {e}")
+
+
+def build_downloads_archive(downloads_path: Path) -> bytes:
+    """Zip the whole downloads tree into memory."""
+    base = Path(tempfile.gettempdir()) / f"ebay_data_{os.getpid()}"
+    archive = shutil.make_archive(str(base), 'zip', downloads_path)
+    try:
+        return Path(archive).read_bytes()
+    finally:
+        Path(archive).unlink(missing_ok=True)
 
 
 def render_footer() -> None:
     """Export controls shown under every tab."""
     st.divider()
     downloads_path = Path.cwd() / BASE_SAVE_DIR
+    has_data = downloads_path.exists() and any(downloads_path.iterdir())
     col_zip, col_open = st.columns(2)
 
     with col_zip:
-        if not downloads_path.exists() or not any(downloads_path.iterdir()):
+        # Building the archive is deliberately behind a click. Zipping every
+        # downloaded image on each script rerun made the whole app stall once
+        # a few batches had been scraped.
+        payload = st.session_state.get('zip_payload')
+        if payload:
+            st.download_button(
+                "Download all data (ZIP)", data=payload,
+                file_name=f"ebay_data_{st.session_state.get('zip_stamp', 'export')}.zip",
+                mime="application/zip", width='stretch',
+            )
+        elif not has_data:
             st.button("Download all data (ZIP)", disabled=True, width='stretch',
                       help="Nothing has been scraped yet.")
-        else:
+        elif st.button("Prepare data export (ZIP)", width='stretch'):
             try:
-                with st.spinner("Preparing archive..."):
-                    buffer = BytesIO()
-                    base = Path(tempfile.gettempdir()) / f"ebay_data_{os.getpid()}"
-                    archive = shutil.make_archive(str(base), 'zip', downloads_path)
-                    buffer.write(Path(archive).read_bytes())
-                    Path(archive).unlink(missing_ok=True)
-                st.download_button(
-                    "Download all data (ZIP)",
-                    data=buffer.getvalue(),
-                    file_name=f"ebay_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                    mime="application/zip",
-                    width='stretch',
-                )
+                with st.spinner("Zipping downloads..."):
+                    st.session_state.zip_payload = build_downloads_archive(downloads_path)
+                st.session_state.zip_stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                st.rerun()
             except Exception as e:
-                logger.error(f"Could not build the ZIP archive: {e}")
-                st.button("Download all data (ZIP)", disabled=True, width='stretch',
-                          help=f"Archive failed: {e}")
+                logger.error(f"Could not build the ZIP archive: {traceback.format_exc()}")
+                st.error(f"Could not build the archive: {e}")
 
     with col_open:
         # Only meaningful when the app runs on the same machine as the browser.
@@ -3959,6 +4237,142 @@ AI_PRESET_PROMPTS = {
 def _pick_source_file(files: List[str]) -> int:
     """Index of the file to preselect — the raw scrape when it exists."""
     return next((i for i, name in enumerate(files) if "raw_scrape.txt" in name), 0)
+
+
+def listing_filename(folder_name: str, platform: str) -> str:
+    """Filename a generated listing is saved under, inside its product folder."""
+    return f"{folder_name}_{platform}_listing.txt"
+
+
+def has_listing(folder_info: Dict[str, Any], platform: str) -> bool:
+    """True when this folder already holds a listing for the given platform."""
+    target = listing_filename(folder_info['folder_name'], platform)
+    return target in (folder_info.get('listing_files') or [])
+
+
+def generate_listing_for_folder(processor: "GroqProcessor", file_manager: "FileManager",
+                                folder_info: Dict[str, Any], platform: str,
+                                custom_instructions: str = "") -> Tuple[str, Path]:
+    """Generate one listing and write it into the product folder.
+
+    Returns (text, saved_path). Raises AIServiceError when the model call
+    fails, and OSError when the folder cannot be written to.
+    """
+    files = folder_info.get('text_files') or []
+    if not files:
+        raise AIServiceError("No source text in this folder.", 'no_source')
+    source = files[_pick_source_file(files)]
+    raw_text = file_manager.load_product_text(folder_info['folder_path'], source)
+    if not raw_text.strip():
+        raise AIServiceError(f"`{source}` is empty.", 'no_source')
+
+    text = processor.platform_agent.generate_platform_description(
+        raw_text=raw_text, product_data=None, platform=platform,
+        custom_instructions=custom_instructions,
+    )
+    out_path = Path(folder_info['folder_path']) / listing_filename(folder_info['folder_name'], platform)
+    out_path.write_text(text, encoding='utf-8')
+    return text, out_path
+
+
+def render_bulk_generator(groq_api_key: str, file_manager: "FileManager") -> None:
+    """Generate listings for many scraped folders in one run.
+
+    This is the batch counterpart to the single-folder generator: after a
+    batch scrape of 50 listings, generating each one by hand is the slowest
+    part of the workflow.
+    """
+    product_folders = file_manager.get_existing_product_folders()
+    if not product_folders:
+        st.info("No scraped products yet. Use the Batch Processing tab first.")
+        return
+
+    col_platform, col_scope = st.columns([1, 1])
+    platform = col_platform.selectbox("Platform", AI_PLATFORMS, key="bulk_platform")
+    skip_existing = col_scope.checkbox(
+        "Skip folders that already have this listing", value=True,
+        help="Uncheck to regenerate and overwrite existing listings.",
+    )
+
+    with st.expander("Custom instructions", expanded=False):
+        custom_instructions = st.text_area(
+            "Applied to every listing", height=80, label_visibility="collapsed",
+            placeholder="e.g. always mention free returns",
+        )
+
+    pending = [f for f in product_folders if not (skip_existing and has_listing(f, platform))]
+    done_count = len(product_folders) - len(pending)
+
+    summary = st.columns(3)
+    summary[0].metric("Folders", len(product_folders))
+    summary[1].metric("To generate", len(pending))
+    summary[2].metric("Already done", done_count)
+
+    names = [f['folder_name'] for f in pending]
+    chosen = st.multiselect("Folders to process", options=names, default=names)
+    targets = [f for f in pending if f['folder_name'] in chosen]
+
+    if st.button(f"Generate {len(targets)} listing(s)", type="primary",
+                 disabled=not targets, width='stretch'):
+        progress = st.progress(0.0)
+        status = st.empty()
+        results: List[Dict[str, str]] = []
+        stopped = ''
+
+        try:
+            processor = GroqProcessor(groq_api_key)
+        except AIServiceError as e:
+            st.error(str(e))
+            return
+
+        for position, folder in enumerate(targets, start=1):
+            name = folder['folder_name']
+            status.caption(f"Generating {position}/{len(targets)} — {name}")
+            try:
+                _, path = generate_listing_for_folder(
+                    processor, file_manager, folder, platform, custom_instructions
+                )
+                results.append({'Folder': name, 'Status': 'done', 'Detail': path.name})
+            except AIServiceError as e:
+                results.append({'Folder': name, 'Status': 'error', 'Detail': str(e)})
+                if e.kind in AI_FATAL_KINDS:
+                    # Every remaining call would fail identically — stop here
+                    # and keep what has already been written to disk.
+                    stopped = str(e)
+                    break
+            except OSError as e:
+                results.append({'Folder': name, 'Status': 'error',
+                                'Detail': f"Could not save the listing: {e}"})
+            except Exception as e:
+                logger.error(f"Bulk generation failed for {name}: {traceback.format_exc()}")
+                results.append({'Folder': name, 'Status': 'error', 'Detail': str(e)[:200]})
+            progress.progress(position / len(targets))
+
+        progress.empty()
+        status.empty()
+        bump_data_version()
+        st.session_state.bulk_results = results
+        st.session_state.bulk_stopped = stopped
+        st.rerun()
+
+    results = st.session_state.get('bulk_results')
+    if results:
+        succeeded = sum(1 for r in results if r['Status'] == 'done')
+        failed = len(results) - succeeded
+        stopped = st.session_state.get('bulk_stopped', '')
+        if stopped:
+            st.error(f"Stopped after {len(results)} folder(s): {stopped}")
+            st.caption("Listings generated before the stop are saved. Re-run to continue "
+                       "where it left off — completed folders are skipped.")
+        elif failed:
+            st.warning(f"{succeeded} generated, {failed} failed.")
+        else:
+            st.success(f"Generated {succeeded} listing(s) for {platform}.")
+        st.dataframe(pd.DataFrame(results), width='stretch', hide_index=True)
+        if st.button("Clear results"):
+            st.session_state.pop('bulk_results', None)
+            st.session_state.pop('bulk_stopped', None)
+            st.rerun()
 
 
 def _load_folder_context(file_manager: "FileManager", folder_info: Dict[str, str],
@@ -4029,9 +4443,10 @@ def render_content_generator(groq_api_key: str, file_manager: "FileManager") -> 
                         "folder": selected_folder_name,
                         "timestamp": datetime.now().strftime("%H:%M"),
                     }
-                    out_name = f"{selected_folder_name}_{target_platform}_listing.txt"
+                    out_name = listing_filename(selected_folder_name, target_platform)
                     try:
                         (Path(folder_info["folder_path"]) / out_name).write_text(result_text, encoding='utf-8')
+                        bump_data_version()
                         st.toast(f"Saved {out_name}")
                     except OSError as e:
                         logger.warning(f"Could not save generated listing: {e}")
@@ -4153,9 +4568,11 @@ def render_ai_tab(groq_api_key: str, file_manager: "FileManager") -> None:
                 "Free keys are available at console.groq.com/keys.")
         return
 
-    gen_tab, chat_tab = st.tabs(["Content Generator", "Assistant"])
+    gen_tab, bulk_tab, chat_tab = st.tabs(["Content Generator", "Bulk Generate", "Assistant"])
     with gen_tab:
         render_content_generator(groq_api_key, file_manager)
+    with bulk_tab:
+        render_bulk_generator(groq_api_key, file_manager)
     with chat_tab:
         render_ai_assistant(groq_api_key, file_manager)
 
@@ -4295,6 +4712,46 @@ def inject_global_styles() -> None:
             border-right: 1px solid var(--border) !important;
             box-shadow: 4px 0 24px rgba(15, 23, 42, 0.04);
         }
+
+        /* Sidebar open/close controls.
+           Streamlit ships these as visibility:hidden and only reveals them
+           when the pointer is over the relevant corner. The hero banner sits
+           across that corner, so once the sidebar was collapsed there was no
+           discoverable way to bring it back. Both controls are therefore
+           pinned visible, given a solid chip style and lifted above the hero. */
+        [data-testid="stSidebarCollapseButton"],
+        [data-testid="stSidebarCollapseButton"] button,
+        [data-testid="stExpandSidebarButton"],
+        [data-testid="stExpandSidebarButton"] button {
+            visibility: visible !important;
+            opacity: 1 !important;
+            pointer-events: auto !important;
+        }
+        [data-testid="stExpandSidebarButton"] {
+            position: fixed !important;
+            top: 0.65rem !important;
+            left: 0.65rem !important;
+            z-index: 1000000 !important;
+            background: var(--surface) !important;
+            border: 1px solid var(--border-strong) !important;
+            border-radius: 10px !important;
+            box-shadow: var(--shadow-md) !important;
+            width: 34px !important;
+            height: 34px !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
+        [data-testid="stExpandSidebarButton"]:hover {
+            border-color: var(--accent) !important;
+            background: var(--surface-3) !important;
+        }
+        [data-testid="stExpandSidebarButton"] svg,
+        [data-testid="stSidebarCollapseButton"] svg {
+            fill: var(--text) !important;
+            color: var(--text) !important;
+        }
+        /* Keep the hero clear of the pinned expand chip */
+        .es-hero { position: relative; z-index: 1; }
         section[data-testid="stSidebar"] > div { padding: 1.25rem 0.85rem !important; }
         section[data-testid="stSidebar"] h2,
         section[data-testid="stSidebar"] h3 { color: var(--text) !important; }
@@ -4702,6 +5159,19 @@ def inject_global_styles() -> None:
         .stMultiSelect [data-baseweb="select"] svg {
             fill: var(--text-soft) !important;
         }
+        /* Selected multiselect chips sit on the dark brand colour, so they are
+           the one place inside a select that must keep light text. Re-asserted
+           here because the rule above would otherwise repaint them dark and
+           the chip labels would vanish into their own background. */
+        .stMultiSelect [data-baseweb="tag"],
+        .stMultiSelect [data-baseweb="tag"] div,
+        .stMultiSelect [data-baseweb="tag"] span {
+            color: #ffffff !important;
+            -webkit-text-fill-color: #ffffff !important;
+        }
+        .stMultiSelect [data-baseweb="tag"] svg {
+            fill: #ffffff !important;
+        }
 
         /* Dropdown menu/options. These render in a body-level portal, so the
            selectors are intentionally global (not scoped under .stApp). */
@@ -4957,6 +5427,7 @@ def handle_single_product_scrape(ebay_url: str, scraper: EbayScraper, file_manag
         csv_updated = append_to_local_csv(result.product_data)
         log_single(STATUS_DONE, product=result.product_data,
                    folder=str(folder_path), images=len(downloaded_images))
+        bump_data_version()
 
         progress_bar.empty()
         status_msg.empty()
