@@ -32,11 +32,12 @@ import tempfile
 import threading
 import time
 import traceback
+import unicodedata
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import pandas as pd
@@ -555,6 +556,92 @@ WORKSHEET_NAMES_TO_TRY = [
 ]
 DEFAULT_SHEET_ID = "1YsDXTexrtz3h-uaErbwhLZlDVGLDUKoIT3By-5UrhLI"
 
+# Downloaded images are normalised to JPEG. eBay serves WebP to modern
+# browsers and most listing tools and photo editors still cannot open it.
+SAVE_IMAGES_AS_JPEG = True
+JPEG_QUALITY = 92
+
+# Summary-row labels per regional site. Class-name matching handles most
+# listings, but eBay localises the visible labels, so an English-only list
+# silently loses condition and location on ebay.fr, .de, .it and .es — which
+# is exactly what the reported logs showed.
+LABELS_CONDITION = [
+    'condition', 'item condition',
+    'état', 'etat', 'état de l\'objet', 'etat de l\'objet',   # French
+    'artikelzustand', 'zustand',                              # German
+    'condizione', 'condizioni', "condizione dell'oggetto",    # Italian
+    'estado', 'estado del artículo', 'estado del articulo',   # Spanish
+    'staat', 'conditie',                                      # Dutch
+    'stan',                                                   # Polish
+]
+
+LABELS_LOCATION = [
+    'located in', 'item location', 'location', 'ships from',
+    'lieu où se trouve l\'objet', 'lieu ou se trouve l\'objet',
+    'lieu', 'se trouve à', 'se trouve a', 'expédié depuis', 'expedie depuis',
+    'artikelstandort', 'standort', 'versand aus',
+    'luogo in cui si trova l\'oggetto', 'si trova a', 'spedizione da',
+    'ubicación del artículo', 'ubicacion del articulo', 'ubicación', 'ubicacion',
+    'objectlocatie', 'locatie',
+    'lokalizacja przedmiotu',
+]
+
+LABELS_SHIPPING = [
+    'shipping', 'delivery', 'postage',
+    'livraison', 'frais de livraison', 'expédition', 'expedition',
+    'versand', 'versandkosten', 'lieferung',
+    'spedizione', 'costi di spedizione', 'consegna',
+    'envío', 'envio', 'gastos de envío', 'gastos de envio',
+    'verzending', 'verzendkosten',
+    'wysyłka', 'wysylka',
+]
+
+LABELS_RETURNS = [
+    'returns', 'return policy',
+    'retours', 'politique de retour', 'renvois',
+    'rücknahme', 'rucknahme', 'rückgabe', 'ruckgabe', 'rücknahmebedingungen',
+    'restituzioni', 'resi', 'politica di reso',
+    'devoluciones', 'política de devoluciones', 'politica de devoluciones',
+    'retourbeleid', 'retourneren',
+    'zwroty',
+]
+
+
+def normalize_label(text: str) -> str:
+    """Fold a label to a comparable form: lowercase, unaccented, no trailing colon.
+
+    Folding accents means the label lists do not have to carry every spelling
+    variant ('État', 'Etat', 'ETAT') for each language.
+    """
+    value = str(text or '').strip().lower()
+    value = value.rstrip(':').strip()
+    decomposed = unicodedata.normalize('NFKD', value)
+    return ''.join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
+def convert_bytes_to_jpeg(payload: bytes, quality: int = JPEG_QUALITY) -> Optional[bytes]:
+    """Re-encode image bytes as JPEG. Returns None when the input is unreadable.
+
+    Transparency is flattened onto white rather than dropped, which would
+    otherwise turn transparent product cut-outs black.
+    """
+    try:
+        with Image.open(BytesIO(payload)) as image:
+            image.load()
+            if image.mode in ('RGBA', 'LA') or (image.mode == 'P' and 'transparency' in image.info):
+                background = Image.new('RGB', image.size, (255, 255, 255))
+                rgba = image.convert('RGBA')
+                background.paste(rgba, mask=rgba.split()[-1])
+                image = background
+            elif image.mode != 'RGB':
+                image = image.convert('RGB')
+            buffer = BytesIO()
+            image.save(buffer, format='JPEG', quality=quality, optimize=True, subsampling=0)
+            return buffer.getvalue()
+    except Exception as e:
+        logger.debug(f"JPEG conversion failed: {e}")
+        return None
+
 # =============================================================================
 # DATA MODELS
 # =============================================================================
@@ -716,36 +803,79 @@ def raise_ai_error(exc: BaseException) -> None:
 # UTILITY FUNCTIONS
 # =============================================================================
 
-def safe_request(session: requests.Session, url: str, timeout: int = 30, max_retries: int = 3) -> Optional[requests.Response]:
+class FetchOutcome(NamedTuple):
+    """Result of an HTTP fetch, with the failure cause preserved.
+
+    The cause matters: a 403 from eBay's edge means "you are being throttled,
+    slow down", while an empty page after a 200 means the layout changed.
+    Collapsing both into `None` is what made every failure surface as the
+    misleading "Could not extract the product title".
     """
-    Make a safe HTTP request with exponential backoff retry logic.
+    response: Optional[requests.Response]
+    reason: str = ''    # '' | 'blocked' | 'not_found' | 'network'
+    detail: str = ''
+
+
+# Statuses eBay's edge returns when it is throttling or challenging a client.
+BLOCK_STATUSES = frozenset({403, 429, 503})
+
+
+def _retry_after_seconds(response: requests.Response) -> float:
+    """Honour a Retry-After header when the server sends one."""
+    raw = (response.headers.get('Retry-After') or '').strip()
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, min(float(raw), 120.0))
+    except ValueError:
+        return 0.0
+
+
+def safe_request(session: requests.Session, url: str, timeout: int = 30,
+                 max_retries: int = 3) -> FetchOutcome:
+    """Fetch a URL with backoff, reporting *why* it failed.
+
+    A blocked response backs off harder than a network error and honours
+    Retry-After, because hammering an edge that is already throttling is what
+    turns a slow batch into a completely failed one.
     """
+    last = FetchOutcome(None, 'network', 'Request failed.')
     for attempt in range(max_retries):
         try:
             response = session.get(url, timeout=timeout)
-            response.raise_for_status()
-            return response
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code if e.response else 0
-            if status in [404, 410]: # Not found, don't retry
-                 logger.error(f"Page not found: {url}")
-                 return None
-            if status == 429: # Rate limit
-                wait_time = (2 ** attempt) + random.uniform(1, 3)
-                logger.warning(f"Rate limited. Waiting {wait_time:.2f}s...")
-                time.sleep(wait_time)
+            status = response.status_code
+
+            if status in (404, 410):
+                logger.info(f"Listing not available (HTTP {status}): {url}")
+                return FetchOutcome(None, 'not_found', f"HTTP {status}")
+
+            if status in BLOCK_STATUSES:
+                last = FetchOutcome(None, 'blocked', f"HTTP {status}")
+                wait = _retry_after_seconds(response) or (2 ** (attempt + 1)) + random.uniform(1.0, 3.0)
+                logger.warning(
+                    f"eBay returned HTTP {status} for {url} "
+                    f"(attempt {attempt + 1}/{max_retries}); backing off {wait:.1f}s"
+                )
+                if attempt < max_retries - 1:
+                    time.sleep(wait)
                 continue
-            logger.warning(f"HTTP error {e} on attempt {attempt + 1}")
+
+            response.raise_for_status()
+            return FetchOutcome(response)
+
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            last = FetchOutcome(None, 'network', f"HTTP {status}")
+            logger.warning(f"HTTP error {status} for {url} on attempt {attempt + 1}")
         except requests.RequestException as e:
+            last = FetchOutcome(None, 'network', str(e)[:200])
             logger.warning(f"Request failed: {e}. Attempt {attempt + 1}/{max_retries}")
-        
-        # Exponential backoff
+
         if attempt < max_retries - 1:
-            sleep_time = (2 ** attempt) + random.uniform(0.5, 1.5)
-            time.sleep(sleep_time)
-            
-    logger.error(f"Failed to fetch {url} after {max_retries} attempts")
-    return None
+            time.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
+
+    logger.error(f"Failed to fetch {url} after {max_retries} attempts ({last.reason})")
+    return last
 
 def clean_filename(filename: str, max_length: int = 100) -> str:
     """
@@ -801,9 +931,32 @@ class EbayScraper:
     - Rate limiting and anti-detection measures
     """
     
+    # Accept-Language per regional site. Requesting a French listing with an
+    # en-US header is an obvious mismatch, and it also returns English labels
+    # that the localized extractors then have to guess at.
+    DOMAIN_LANGUAGES = {
+        'ebay.fr': 'fr-FR,fr;q=0.9,en;q=0.7',
+        'ebay.de': 'de-DE,de;q=0.9,en;q=0.7',
+        'ebay.at': 'de-AT,de;q=0.9,en;q=0.7',
+        'ebay.ch': 'de-CH,de;q=0.9,fr;q=0.8,en;q=0.7',
+        'ebay.it': 'it-IT,it;q=0.9,en;q=0.7',
+        'ebay.es': 'es-ES,es;q=0.9,en;q=0.7',
+        'ebay.nl': 'nl-NL,nl;q=0.9,en;q=0.7',
+        'ebay.be': 'nl-BE,nl;q=0.9,fr;q=0.8,en;q=0.7',
+        'ebay.pl': 'pl-PL,pl;q=0.9,en;q=0.7',
+        'ebay.co.uk': 'en-GB,en;q=0.9',
+        'ebay.ie': 'en-IE,en;q=0.9',
+        'ebay.com.au': 'en-AU,en;q=0.9',
+        'ebay.ca': 'en-CA,en;q=0.9,fr;q=0.8',
+    }
+
     def __init__(self):
         """Initialize the scraper with configured session."""
         self.session = self._build_session()
+        self._warmed_hosts: set = set()
+        # Consecutive blocked fetches, used to slow down before eBay does it
+        # for us. Reset by any successful listing fetch.
+        self.consecutive_blocks = 0
         logger.info("eBay scraper initialized")
 
     def _build_session(self) -> requests.Session:
@@ -829,7 +982,54 @@ class EbayScraper:
         except Exception:
             pass
         self.session = self._build_session()
+        self._warmed_hosts = set()
         logger.info("Scraper identity refreshed (new session + user agent)")
+
+    def _site_language(self, host: str) -> str:
+        for domain, language in self.DOMAIN_LANGUAGES.items():
+            if host.endswith(domain):
+                return language
+        return 'en-US,en;q=0.9'
+
+    def prepare_for(self, url: str) -> None:
+        """Make the session look like a browser that arrived from the site.
+
+        A real visitor lands on the homepage first and carries its cookies and
+        a Referer into the listing. Requesting a deep item URL cold, with no
+        cookies and a mismatched language, is one of the cheapest signals for
+        an edge to flag — and warming up costs one request per host per
+        session.
+        """
+        try:
+            host = urlparse(url).netloc.lower()
+        except Exception:
+            return
+        if not host:
+            return
+
+        self.session.headers['Accept-Language'] = self._site_language(host)
+        self.session.headers['Referer'] = f"https://{host}/"
+
+        if host in self._warmed_hosts:
+            return
+        self._warmed_hosts.add(host)
+        try:
+            self.session.get(f"https://{host}/", timeout=15)
+            time.sleep(random.uniform(0.8, 1.8))
+            logger.debug(f"Warmed up session for {host}")
+        except requests.RequestException as e:
+            # Not fatal: the listing request may still succeed on its own.
+            logger.debug(f"Warm-up request for {host} failed: {e}")
+
+    def cooldown_seconds(self) -> float:
+        """How long to wait before the next listing, given recent blocks.
+
+        Backing off while eBay is actively refusing traffic is what turns a
+        run where most rows fail into one where most rows succeed.
+        """
+        if self.consecutive_blocks <= 0:
+            return random.uniform(1.0, 2.5)
+        return min(15.0, 3.0 * self.consecutive_blocks) + random.uniform(1.0, 3.0)
     
     # Known eBay regional domains and short link hosts
     EBAY_DOMAINS = (
@@ -1025,7 +1225,7 @@ class EbayScraper:
             # summary row, so try that first and fall back to the older
             # standalone elements.
             product_data.condition = self._extract_labeled_value(
-                soup, ['condition'], ['condition'], 'condition'
+                soup, ['condition'], LABELS_CONDITION, 'condition'
             ) or self._extract_text_by_selectors(soup, [
                 '.x-item-condition-value .ux-textspans',
                 '.x-item-condition-max-view .ux-section__item',
@@ -1049,8 +1249,7 @@ class EbayScraper:
             
             # Extract shipping information
             product_data.shipping = self._extract_labeled_value(
-                soup, ['shipping', 'delivery'],
-                ['shipping', 'delivery', 'postage'], 'shipping'
+                soup, ['shipping', 'delivery'], LABELS_SHIPPING, 'shipping'
             ) or self._extract_text_by_selectors(soup, [
                 '[data-testid="ux-labels-values"] .ux-textspans--BOLD',
                 '[data-testid="vi-price-ship"]',
@@ -1067,15 +1266,14 @@ class EbayScraper:
 
             # Additional fields for richer AI prompts
             product_data.location = self._extract_labeled_value(
-                soup, ['itemLocation', 'location'],
-                ['located in', 'item location', 'location', 'ships from'], 'location'
+                soup, ['itemLocation', 'location'], LABELS_LOCATION, 'location'
             ) or self._extract_text_by_selectors(soup, [
                 '#itemLocation', '.item-location',
                 '[data-testid="ux-seller-location"]', '.ux-seller-section__itemLocation',
             ], "location")
 
             product_data.returns_policy = self._extract_labeled_value(
-                soup, ['returns'], ['returns', 'return policy'], 'returns'
+                soup, ['returns'], LABELS_RETURNS, 'returns'
             ) or self._extract_text_by_selectors(soup, [
                 '#vi-ret-accrd-txt', '.x-ret-accrd-txt', '.returns-policy',
             ], "returns")
@@ -1213,7 +1411,7 @@ class EbayScraper:
             except Exception as e:
                 logger.debug(f"Label modifier {modifier} failed for {field_name}: {e}")
 
-        wanted = {label.strip().lower().rstrip(':') for label in labels}
+        wanted = {normalize_label(label) for label in labels}
         try:
             candidates = soup.find_all(['span', 'div', 'th', 'dt', 'td', 'label'])
         except Exception:
@@ -1221,7 +1419,7 @@ class EbayScraper:
 
         for node in candidates:
             try:
-                text = node.get_text(' ', strip=True).lower().rstrip(':').strip()
+                text = normalize_label(node.get_text(' ', strip=True))
             except Exception:
                 continue
             if text not in wanted:
@@ -1239,7 +1437,7 @@ class EbayScraper:
         container, then for the next sibling cell. Anything that just repeats
         the label is rejected so a row never reports its own heading.
         """
-        label_text = label_node.get_text(' ', strip=True).lower().rstrip(':').strip()
+        label_text = normalize_label(label_node.get_text(' ', strip=True))
         node: Optional[Tag] = label_node
         for _ in range(max_levels):
             if node is None:
@@ -1253,40 +1451,62 @@ class EbayScraper:
                 value_node = None
             if value_node is not None:
                 text = self._get_clean_text(value_node)
-                if text and text.lower().rstrip(':').strip() != label_text:
+                if text and normalize_label(text) != label_text:
                     return text
             sibling = node.find_next_sibling()
             while sibling is not None:
                 if isinstance(sibling, Tag):
                     text = self._get_clean_text(sibling)
-                    if text and text.lower().rstrip(':').strip() != label_text:
+                    if text and normalize_label(text) != label_text:
                         return text
                 sibling = sibling.find_next_sibling()
             node = parent
         return ''
 
+    # Words meaning "breadcrumb" on the regional sites, matched against the
+    # nav's aria-label. ebay.fr labels it "Fil d'Ariane", so an English-only
+    # match returned no category at all on every non-English listing.
+    BREADCRUMB_ARIA = (
+        'readcrumb', 'fil d\'ariane', 'ariane', 'navigationspfad', 'brotkrumen',
+        'percorso', 'ruta de navegaci', 'kruimelpad', 'okruszki',
+    )
+
+    HOME_LINK_TEXTS = {'ebay', 'back to home page', 'accueil', 'startseite',
+                       'home', 'inicio', 'pagina iniziale'}
+
     def _extract_breadcrumbs(self, soup: BeautifulSoup) -> str:
         """Category path, joined with ' > '."""
-        selectors = [
-            'nav[aria-label*="readcrumb" i]',
-            '.seo-breadcrumb-text',
-            '#vi-VR-brumb-lnkLst',
-            '.breadcrumbs',
-            '.bc-w',
-        ]
-        for selector in selectors:
+        candidates: List[Tag] = []
+        for selector in ('.seo-breadcrumb-text', '#vi-VR-brumb-lnkLst',
+                         '.breadcrumbs', '.bc-w',
+                         '[itemtype*="BreadcrumbList" i]'):
             try:
-                nav = soup.select_one(selector)
+                node = soup.select_one(selector)
             except Exception:
                 continue
-            if nav is None:
-                continue
-            parts = [a.get_text(' ', strip=True) for a in nav.select('a')]
+            if node is not None:
+                candidates.append(node)
+
+        # Any <nav> whose aria-label reads as "breadcrumb" in some language,
+        # then, as a last resort, any nav holding a list of links.
+        try:
+            navs = soup.find_all('nav')
+        except Exception:
+            navs = []
+        labelled, generic = [], []
+        for nav in navs:
+            aria = normalize_label(nav.get('aria-label') or '')
+            (labelled if any(word in aria for word in self.BREADCRUMB_ARIA) else generic).append(nav)
+        candidates.extend(labelled)
+        candidates.extend(generic)
+
+        for node in candidates:
+            parts = [a.get_text(' ', strip=True) for a in node.select('a')]
             if not parts:
-                parts = [li.get_text(' ', strip=True) for li in nav.select('li')]
+                parts = [li.get_text(' ', strip=True) for li in node.select('li')]
             cleaned = [p for p in dict.fromkeys(parts)
-                       if p and p.lower() not in ('ebay', 'back to home page')]
-            if cleaned:
+                       if p and normalize_label(p) not in self.HOME_LINK_TEXTS]
+            if len(cleaned) >= 1:
                 return " > ".join(cleaned[:8])
         return ''
 
@@ -1426,7 +1646,7 @@ class EbayScraper:
                             iframe_src = iframe.get('src') or iframe.get('data-src')
                             iframe_url = urljoin(base_url, iframe_src)
                             
-                            response = safe_request(self.session, iframe_url, timeout=15)
+                            response = safe_request(self.session, iframe_url, timeout=15).response
                             if response:
                                 iframe_soup = BeautifulSoup(response.content, 'html.parser')
                                 description_text = iframe_soup.get_text(separator=' ', strip=True)
@@ -1667,22 +1887,32 @@ class EbayScraper:
             Final saved file path or None if download failed
         """
         try:
-            response = safe_request(self.session, img_url, timeout=30)
+            response = safe_request(self.session, img_url, timeout=30).response
             if not response:
                 return None
-            
-            # Determine file extension from content type or URL
+
             content_type = response.headers.get('Content-Type', '').lower()
             extension = self._get_image_extension(content_type, img_url)
-            
+            payload = response.content
+
+            # eBay serves WebP to modern browsers, which most listing tools and
+            # photo editors still refuse to open. Normalising to JPEG at
+            # download time means the product folders only ever contain files
+            # that can be uploaded straight to another marketplace.
+            if SAVE_IMAGES_AS_JPEG and extension != 'jpg':
+                converted = convert_bytes_to_jpeg(payload)
+                if converted is not None:
+                    payload, extension = converted, 'jpg'
+                else:
+                    logger.debug(f"Keeping original format for {img_url} (conversion failed)")
+
             final_path = f"{save_path}.{extension}"
-            
             with open(final_path, 'wb') as f:
-                f.write(response.content)
-            
+                f.write(payload)
+
             logger.debug(f"Downloaded image: {final_path}")
             return final_path
-            
+
         except Exception as e:
             logger.error(f"Error downloading image {img_url}: {e}")
             return None
@@ -1708,8 +1938,11 @@ class EbayScraper:
     
     # Phrases that appear on eBay's bot-check / interstitial pages but not on
     # real listings. Deliberately specific: generic words like "robot" false-
-    # positive on legitimate listings (e.g. robot vacuum cleaners).
+    # positive on legitimate listings (e.g. robot vacuum cleaners). The
+    # non-English entries matter because a regional site serves its challenge
+    # page in the local language.
     BOT_PAGE_MARKERS = (
+        # English
         'pardon our interruption',
         'checking your browser',
         'please verify yourself',
@@ -1718,29 +1951,67 @@ class EbayScraper:
         'unusual traffic',
         'splashui/captcha',
         'are you a human',
+        'access to this page has been denied',
+        'enable javascript and cookies to continue',
+        # French (ebay.fr)
+        'veuillez patienter',
+        "vérifiez que vous n'êtes pas un robot",
+        'excusez-nous pour cette interruption',
+        'activez javascript',
+        # German (ebay.de / .at / .ch)
+        'entschuldigen sie die unterbrechung',
+        'bitte bestätigen sie',
+        'sind sie ein mensch',
+        # Italian / Spanish
+        'ci scusiamo per l',
+        'perdona la interrupción',
+        'verifica que eres humano',
     )
 
     def _looks_like_bot_page(self, soup: BeautifulSoup) -> bool:
         """Detect eBay's anti-bot interstitial pages.
 
-        These pages return HTTP 200 but contain no listing content, which is
-        why extraction previously produced a storm of "No <field> found"
-        warnings and empty products. Detecting them up front lets the caller
-        retry with a fresh identity instead of saving garbage.
+        These pages return HTTP 200 but carry no listing content, which used
+        to surface as a storm of empty fields and the misleading "the listing
+        may have ended". Marker text is the fast path; the structural check
+        below catches localized or reworded challenge pages that no marker
+        list will ever fully cover.
         """
         try:
             text = soup.get_text(" ", strip=True).lower()
-            # Bot pages are short; only scan the head of real (huge) pages.
             head = text[:5000]
             if any(marker in head for marker in self.BOT_PAGE_MARKERS):
                 return True
-            # A "page" with almost no text and no title element is an
-            # interstitial or an error shell, not a listing.
+            # A "page" with almost no text and no heading is an interstitial
+            # or an error shell, not a listing.
             if len(text) < 400 and not soup.select_one('h1'):
                 return True
+            # A real listing always carries an item-scoped element. A page
+            # without any of them, and without a single eBay image, is a
+            # challenge or redirect shell no matter how much boilerplate text
+            # it contains.
+            listing_markers = soup.select_one(
+                'h1.x-item-title__mainTitle, [data-testid="x-item-title"], '
+                '#itemTitle, .x-price-primary, [data-testid="x-price-primary"], '
+                '.ux-labels-values, #vi-desc-maincntr'
+            )
+            if listing_markers is None:
+                has_item_image = any(
+                    'i.ebayimg.com' in (img.get('src') or img.get('data-src') or '')
+                    for img in soup.find_all('img', limit=40)
+                )
+                if not has_item_image:
+                    return True
         except Exception:
             pass
         return False
+
+    BLOCKED_MESSAGE = (
+        "eBay refused the request (anti-bot check). This is rate limiting, not a "
+        "problem with the link — eBay throttles bursts from one IP. Wait a few "
+        "minutes, then use Retry failed; the app now slows itself down "
+        "automatically after each block."
+    )
 
     def scrape_product(self, url: str, max_attempts: int = 3) -> ScrapingResult:
         """
@@ -1763,37 +2034,60 @@ class EbayScraper:
             return ScrapingResult(success=False, error_message=f"Invalid URL: {e}")
 
         last_error = "Unknown error"
+        blocked = False
+
         for attempt in range(1, max_attempts + 1):
             try:
                 if attempt > 1:
                     # eBay flagged the previous fingerprint — swap identity and
-                    # back off before retrying.
+                    # back off before retrying. A block earns a longer wait
+                    # than a parsing miss.
                     self.refresh_identity()
-                    time.sleep(min(2 ** attempt, 8) + random.uniform(0.5, 2.0))
+                    base = 6 if blocked else 2
+                    time.sleep(min(base ** attempt, 30) + random.uniform(0.5, 2.0))
                 else:
-                    # Anti-detection delay before the first hit
                     time.sleep(random.uniform(0.5, 2.0))
 
+                self.prepare_for(url)
+
                 # Fetch page (requests follows redirects by default, handling ebay.to/ebay.us)
-                response = safe_request(self.session, url, timeout=30)
-                if not response:
-                    last_error = (
-                        "Could not fetch the eBay page. The listing may have been "
-                        "removed, or eBay is rate-limiting requests — wait 1-2 minutes and retry."
+                outcome = safe_request(self.session, url, timeout=30)
+
+                if outcome.reason == 'not_found':
+                    # Definitive: the listing is gone. Retrying cannot help,
+                    # and burning two more attempts on it slows the batch.
+                    self.consecutive_blocks = 0
+                    return ScrapingResult(
+                        success=False,
+                        error_message="The listing no longer exists on eBay (removed, ended or sold).",
                     )
+
+                if outcome.response is None:
+                    if outcome.reason == 'blocked':
+                        blocked = True
+                        self.consecutive_blocks += 1
+                        last_error = self.BLOCKED_MESSAGE
+                        logger.warning(
+                            f"Blocked by eBay ({outcome.detail}) for {url} "
+                            f"(attempt {attempt}/{max_attempts})"
+                        )
+                    else:
+                        last_error = (
+                            f"Could not reach eBay ({outcome.detail or 'network error'}). "
+                            "Check the internet connection and retry."
+                        )
                     continue
 
                 # Parse HTML
-                soup = BeautifulSoup(response.content, 'html.parser')
+                soup = BeautifulSoup(response_content(outcome.response), 'html.parser')
 
                 # Check for blocked/captcha/interstitial pages
                 if self._looks_like_bot_page(soup):
-                    last_error = (
-                        "eBay served a verification page instead of the listing. "
-                        "Wait a few minutes and retry."
-                    )
+                    blocked = True
+                    self.consecutive_blocks += 1
+                    last_error = self.BLOCKED_MESSAGE
                     logger.warning(
-                        f"Bot-check page detected for {url} "
+                        f"Bot-check page served for {url} "
                         f"(attempt {attempt}/{max_attempts}); retrying with a fresh identity"
                     )
                     continue
@@ -1804,16 +2098,29 @@ class EbayScraper:
 
                 # Validate we got essential data
                 if not product_data.title:
-                    last_error = (
-                        "Could not extract the product title. The listing may have "
-                        "ended or its layout is not supported."
-                    )
-                    logger.warning(
-                        f"No title extracted for {url} "
-                        f"(attempt {attempt}/{max_attempts}); retrying with a fresh identity"
-                    )
+                    if not image_urls and not product_data.price:
+                        # Nothing at all came back: this is a challenge page
+                        # that slipped past the checks above, not a listing
+                        # whose layout we failed to parse.
+                        blocked = True
+                        self.consecutive_blocks += 1
+                        last_error = self.BLOCKED_MESSAGE
+                        logger.warning(
+                            f"Empty listing page for {url} "
+                            f"(attempt {attempt}/{max_attempts}); treating as a block"
+                        )
+                    else:
+                        last_error = (
+                            "Could not extract the product title. The listing may have "
+                            "ended or its layout is not supported."
+                        )
+                        logger.warning(
+                            f"No title extracted for {url} "
+                            f"(attempt {attempt}/{max_attempts}); retrying with a fresh identity"
+                        )
                     continue
 
+                self.consecutive_blocks = 0
                 return ScrapingResult(
                     success=True,
                     product_data=product_data,
@@ -1829,6 +2136,16 @@ class EbayScraper:
                 last_error = "An unexpected error occurred. Please try again."
 
         return ScrapingResult(success=False, error_message=last_error)
+
+
+def response_content(response: requests.Response) -> bytes:
+    """Raw bytes of a response, tolerating a broken transfer encoding."""
+    try:
+        return response.content
+    except Exception as e:
+        logger.warning(f"Could not read response body: {e}")
+        return b''
+
 
 # =============================================================================
 # LOCAL CSV FALLBACK
@@ -3492,7 +3809,7 @@ def process_batch_rows(df: pd.DataFrame, row_indices: List[int], scraper: "EbayS
     """
     progress = st.progress(0.0)
     status_box = st.empty()
-    stats = {'done': 0, 'error': 0, 'duplicate': 0}
+    stats = {'done': 0, 'error': 0, 'duplicate': 0, 'blocked': 0}
     total = len(row_indices)
     persist_ok = True
     source_file = str(meta.get('source_name', '') or '')
@@ -3573,6 +3890,8 @@ def process_batch_rows(df: pd.DataFrame, row_indices: List[int], scraper: "EbayS
                 df.iat[i, STATUS_COL] = STATUS_ERROR
                 notes[str(i)] = message
                 stats['error'] += 1
+                if 'anti-bot' in message or 'refused the request' in message:
+                    stats['blocked'] += 1
                 append_batch_status({**record, 'Status': STATUS_ERROR, 'Details': message})
         except ValidationError as ve:
             df.iat[i, STATUS_COL] = STATUS_ERROR
@@ -3593,10 +3912,18 @@ def process_batch_rows(df: pd.DataFrame, row_indices: List[int], scraper: "EbayS
             progress.progress(pos / total)
             if metrics_slot is not None and table_slot is not None:
                 render_queue_view(df, notes, metrics_slot, table_slot)
-            if pos < total and normalize_status(df.iat[i, STATUS_COL]) == STATUS_DONE:
-                # Polite delay between listings so eBay doesn't rate-limit us.
-                # Skipped rows never hit the network, so they need no delay.
-                time.sleep(random.uniform(1.0, 2.5))
+            if pos < total and normalize_status(df.iat[i, STATUS_COL]) != STATUS_DUPLICATE:
+                # Pause between listings that actually hit the network. The
+                # delay grows while eBay is blocking us, which is what stops a
+                # run from degrading into every remaining row failing.
+                # Duplicates never make a request, so they are not delayed.
+                delay = scraper.cooldown_seconds()
+                if scraper.consecutive_blocks:
+                    status_box.warning(
+                        f"eBay is throttling requests — waiting {delay:.0f}s before the next listing "
+                        f"({scraper.consecutive_blocks} block(s) in a row)."
+                    )
+                time.sleep(delay)
 
     summary = f"{stats['done']} done, {stats['duplicate']} duplicate, {stats['error']} failed"
     status_box.success(f"Batch finished — {summary}.")
@@ -3605,6 +3932,10 @@ def process_batch_rows(df: pd.DataFrame, row_indices: List[int], scraper: "EbayS
     st.session_state.batch_last_run = f"Last run: {summary}."
     if not persist_ok:
         st.session_state.batch_persist_warning = True
+    if stats['blocked']:
+        # Retrying straight away just reproduces the block, which is what
+        # makes the retry button look broken.
+        st.session_state.batch_blocked_count = stats['blocked']
     return stats
 
 
@@ -3673,6 +4004,14 @@ def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> Non
     last_run = st.session_state.pop('batch_last_run', '')
     if last_run:
         st.success(last_run)
+    blocked_count = st.session_state.pop('batch_blocked_count', 0)
+    if blocked_count:
+        st.warning(
+            f"{blocked_count} row(s) failed because eBay refused the request (anti-bot check), "
+            "not because the links are wrong. eBay throttles bursts from one IP address. "
+            "**Wait 10-15 minutes, then press Retry failed** — retrying immediately usually "
+            "hits the same block. Each run now slows itself down automatically after a block."
+        )
 
     # --- Upload ---
     uploaded_file = st.file_uploader(
@@ -3852,10 +4191,12 @@ def render_batch_tab(scraper: "EbayScraper", file_manager: "FileManager") -> Non
 # IMAGE FORMAT CONVERSION HELPERS
 # =============================================================================
 
+# JPG first: it is the default target, and new downloads already arrive as
+# JPEG, so this tab is mainly for folders scraped before that change.
 WEBP_TARGET_FORMATS = {
-    "PNG":  {"ext": ".png",  "pillow": "PNG",  "save_kwargs": {}},
     "JPG":  {"ext": ".jpg",  "pillow": "JPEG", "save_kwargs": {"quality": 95, "subsampling": 0, "optimize": True}},
     "JPEG": {"ext": ".jpeg", "pillow": "JPEG", "save_kwargs": {"quality": 95, "subsampling": 0, "optimize": True}},
+    "PNG":  {"ext": ".png",  "pillow": "PNG",  "save_kwargs": {}},
     "BMP":  {"ext": ".bmp",  "pillow": "BMP",  "save_kwargs": {}},
     "TIFF": {"ext": ".tiff", "pillow": "TIFF", "save_kwargs": {}},
 }
@@ -3894,7 +4235,8 @@ def convert_webp_in_folder(folder: Path, target_key: str) -> Tuple[int, int, Lis
 def render_image_format_tab(file_manager: "FileManager") -> None:
     """Tab to bulk-convert .webp files in a chosen folder to another format."""
     st.subheader("Image Format")
-    st.caption("Convert WebP images in a product folder to another format. Originals are replaced.")
+    st.caption("New downloads are already saved as JPEG. Use this to convert WebP files in "
+               "folders scraped earlier. Originals are replaced.")
 
     base_dir = file_manager.base_dir
     # One cached walk yields both the folders and their counts.
@@ -5246,11 +5588,16 @@ def inject_global_styles() -> None:
         unsafe_allow_html=True,
     )
 
+@st.cache_resource(show_spinner=False)
 def initialize_components() -> Tuple[EbayScraper, FileManager]:
-    """Initialize all application components."""
-    scraper = EbayScraper()
-    file_manager = FileManager()
-    return scraper, file_manager
+    """Build the scraper and file manager once per app process.
+
+    Cached deliberately: a fresh EbayScraper per rerun threw away the cookie
+    jar and re-ran the homepage warm-up on every widget click, and reset the
+    consecutive-block counter that drives the adaptive backoff — so the app
+    could never learn that eBay was throttling it.
+    """
+    return EbayScraper(), FileManager()
 
 def display_scraping_results(result: ScrapingResult, downloaded_images: List[str],
                              folder_path: Path, csv_updated: bool) -> None:
