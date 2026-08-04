@@ -8,8 +8,13 @@ __pycache__/
 
 # Local config / runtime data
 .batch_queue.json
+.batch_state.csv
+.batch_state.csv.tmp
+.batch_state_meta.json
+.batch_state_meta.json.tmp
 .groq_config.json
 .gsheet_config.json
+batch_status_log.csv
 EbayStore_Products.csv
 downloads/
 
