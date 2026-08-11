@@ -12,6 +12,7 @@ __pycache__/
 .batch_state.csv.tmp
 .batch_state_meta.json
 .batch_state_meta.json.tmp
+.ai_config.json
 .groq_config.json
 .gsheet_config.json
 batch_status_log.csv

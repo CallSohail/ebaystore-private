@@ -33,7 +33,7 @@ import threading
 import time
 import traceback
 import unicodedata
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from functools import lru_cache
 from io import BytesIO
@@ -2356,34 +2356,45 @@ def append_to_local_csv(product_data: ProductData, filename: str = 'EbayStore_Pr
 
 
 
-class GroqProcessor:
+class AIProcessor:
+    """AI processing against whichever provider the user selected.
+
+    Every supported provider speaks the OpenAI chat-completions shape, so this
+    class only needs a client and a model name — nothing below this point
+    knows or cares which provider is in use.
+
+    Accepts either an AISettings (the normal path) or a bare API key string,
+    which keeps `AIProcessor("gsk_...")` working exactly as `GroqProcessor`
+    did before providers existed.
     """
-    Enhanced AI processing with Groq, platform agents, chatbot, and caching.
-    """
-    
-    def __init__(self, api_key: str):
-        """Initialize with API key and caching."""
-        self.api_key = api_key
+
+    def __init__(self, settings: Any, model: str = ''):
+        if isinstance(settings, AISettings):
+            self.settings = settings
+        else:
+            # Legacy call style: a plain Groq key.
+            self.settings = AISettings(
+                provider=get_provider(DEFAULT_PROVIDER),
+                api_key=str(settings or ''),
+                model=model,
+            )
+        self.api_key = self.settings.api_key
+        self.provider = self.settings.provider
         self.cache = ResponseCache()
         self._configure_api()
         self.platform_agent = PlatformAgent(self.client, self.model, self.cache)
-    
+
     def _configure_api(self) -> None:
-        """Configure the Groq client.
+        """Build the provider client.
 
         Only construction problems are caught here — an unusable key is not
         detected until the first request, which is where the rate-limit and
         authentication messages come from.
         """
-        if not str(self.api_key or '').strip():
-            raise AIServiceError("No Groq API key set. Add one in the sidebar to use AI features.")
-        try:
-            self.client = Groq(api_key=self.api_key.strip())
-            self.model = "openai/gpt-oss-20b"  # GPT-OSS model via Groq
-            logger.info("Groq API configured successfully")
-        except Exception as e:
-            raise_ai_error(e)
-    
+        self.client = build_ai_client(self.settings)
+        self.model = self.settings.model_name
+        logger.info(f"AI provider configured: {self.provider.label} ({self.model})")
+
     def chat_with_ai(self, user_message: str, context: Optional[Dict] = None) -> str:
         """
         Interactive chat with AI for custom requests.
@@ -2674,8 +2685,12 @@ OUTPUT FORMAT (JSON ONLY):
         except Exception as e:
             logger.error(f"Error generating listing text: {e}")
             return ""
-    
-    
+
+
+# Kept so existing code and any saved snippets that construct GroqProcessor
+# with a bare key keep working; the class is provider-agnostic now.
+GroqProcessor = AIProcessor
+
 
 # =============================================================================
 # FILE MANAGEMENT
@@ -3140,42 +3155,313 @@ class FileManager:
 # STREAMLIT APPLICATION
 # =============================================================================
 
-def load_groq_api_key() -> str:
-    """Load Groq API key from Streamlit secrets, environment, or local config file."""
-    # 1) Streamlit secrets
-    try:
-        if hasattr(st, 'secrets') and "groq_api_key" in st.secrets:
-            key = str(st.secrets["groq_api_key"]).strip()
-            if key:
-                return key
-    except Exception:
-        pass
-    # 2) Environment
-    env_key = os.getenv('GROQ_API_KEY', '').strip()
-    if env_key:
-        return env_key
-    # 3) Local config file
-    try:
-        cfg_path = Path.cwd() / '.groq_config.json'
-        if cfg_path.exists():
-            data = json.load(open(cfg_path, 'r', encoding='utf-8'))
-            key = str(data.get('groq_api_key', '')).strip()
-            if key:
-                return key
-    except Exception as e:
-        logger.warning(f"Could not read .groq_config.json: {e}")
-    return ""
+# =============================================================================
+# AI PROVIDERS
+# =============================================================================
+#
+# Every provider below exposes an OpenAI-compatible /chat/completions endpoint,
+# so one client shape covers all of them: only the base URL, the key and the
+# model change. Adding a sixth provider is a single entry in AI_PROVIDERS —
+# no branching anywhere else.
+#
+# Groq deliberately keeps its own SDK. The existing integration is known to
+# work and there is no reason to put it through a new code path; the two
+# clients expose the same `.chat.completions.create` surface, so everything
+# downstream is identical either way.
 
-def save_groq_api_key(api_key: str) -> bool:
-    """Persist Groq API key to a local config file in the project directory."""
+try:
+    from openai import OpenAI
+    OPENAI_SDK_AVAILABLE = True
+except Exception:  # pragma: no cover - depends on the install
+    OpenAI = None
+    OPENAI_SDK_AVAILABLE = False
+
+
+@dataclass(frozen=True)
+class AIProviderSpec:
+    """Everything that differs between one AI provider and the next."""
+    key: str                       # stable id used in config files
+    label: str                     # shown in the sidebar
+    base_url: str                  # OpenAI-compatible root
+    default_model: str
+    console_url: str               # where the user gets a key
+    key_prefix: str = ''           # typical prefix, used for a soft warning only
+    key_label: str = 'API key'
+    model_hint: str = ''
+    extra_headers: Dict[str, str] = field(default_factory=dict)
+    native_sdk: str = ''           # '' = use the OpenAI-compatible client
+    env_vars: Tuple[str, ...] = ()
+
+
+AI_PROVIDERS: Dict[str, AIProviderSpec] = {
+    'groq': AIProviderSpec(
+        key='groq',
+        label='Groq',
+        base_url='https://api.groq.com/openai/v1',
+        default_model='openai/gpt-oss-20b',
+        console_url='https://console.groq.com/keys',
+        key_prefix='gsk_',
+        key_label='Groq API key',
+        model_hint='Open models on Groq hardware. Very fast, generous free tier.',
+        native_sdk='groq',
+        env_vars=('GROQ_API_KEY',),
+    ),
+    'openrouter': AIProviderSpec(
+        key='openrouter',
+        label='OpenRouter',
+        base_url='https://openrouter.ai/api/v1',
+        default_model='openai/gpt-oss-20b',
+        console_url='https://openrouter.ai/keys',
+        key_prefix='sk-or-',
+        key_label='OpenRouter API key',
+        model_hint='One key for many providers. Model ids look like "vendor/model"; '
+                   'ids ending in ":free" cost nothing.',
+        # Optional attribution headers; OpenRouter uses them for its rankings.
+        extra_headers={
+            'HTTP-Referer': 'https://github.com/CallSohail/ebaystore-private',
+            'X-Title': 'eBay Scraper Studio',
+        },
+        env_vars=('OPENROUTER_API_KEY',),
+    ),
+    'nvidia': AIProviderSpec(
+        key='nvidia',
+        label='NVIDIA NIM',
+        base_url='https://integrate.api.nvidia.com/v1',
+        default_model='meta/llama-3.3-70b-instruct',
+        console_url='https://build.nvidia.com/',
+        key_prefix='nvapi-',
+        key_label='NVIDIA API key',
+        model_hint='Open models hosted by NVIDIA. Ids are prefixed by their vendor, '
+                   'e.g. "meta/..." or "nvidia/...".',
+        env_vars=('NVIDIA_API_KEY', 'NVIDIA_NIM_API_KEY'),
+    ),
+    'gemini': AIProviderSpec(
+        key='gemini',
+        label='Google Gemini',
+        base_url='https://generativelanguage.googleapis.com/v1beta/openai/',
+        default_model='gemini-flash-latest',
+        console_url='https://aistudio.google.com/apikey',
+        key_prefix='AIza',
+        key_label='Google AI Studio key',
+        model_hint='Google\'s own models through their OpenAI-compatible endpoint. '
+                   'Prefer a "-latest" alias: numbered versions get retired.',
+        env_vars=('GEMINI_API_KEY', 'GOOGLE_API_KEY'),
+    ),
+    'huggingface': AIProviderSpec(
+        key='huggingface',
+        label='Hugging Face',
+        base_url='https://router.huggingface.co/v1',
+        default_model='openai/gpt-oss-20b',
+        console_url='https://huggingface.co/settings/tokens',
+        key_prefix='hf_',
+        key_label='Hugging Face token',
+        model_hint='Routes to many inference providers. Append ":provider" to pin one '
+                   '(e.g. "openai/gpt-oss-20b:together"); without it HF picks for you. '
+                   'The token needs the "Make calls to Inference Providers" permission.',
+        env_vars=('HF_TOKEN', 'HUGGINGFACE_API_KEY'),
+    ),
+}
+
+DEFAULT_PROVIDER = 'groq'
+AI_CONFIG_PATH = Path.cwd() / '.ai_config.json'
+LEGACY_GROQ_CONFIG = Path.cwd() / '.groq_config.json'
+
+
+def get_provider(provider_key: str) -> AIProviderSpec:
+    """Look up a provider, falling back to the default for unknown ids."""
+    return AI_PROVIDERS.get(provider_key or '', AI_PROVIDERS[DEFAULT_PROVIDER])
+
+
+@dataclass
+class AISettings:
+    """The provider, key and model a request should use."""
+    provider: AIProviderSpec
+    api_key: str = ''
+    model: str = ''
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.api_key.strip())
+
+    @property
+    def model_name(self) -> str:
+        return (self.model or '').strip() or self.provider.default_model
+
+
+# -----------------------------------------------------------------------------
+# Credential storage
+# -----------------------------------------------------------------------------
+#
+# Precedence: Streamlit secrets, then environment, then a local file. Secrets
+# and environment come first so a deployment can inject credentials without a
+# key ever being written to disk. The local file exists because this app is
+# normally run locally by one person, and re-pasting five keys on every start
+# is not realistic — it is created 0600 and is gitignored.
+
+def _read_local_config() -> Dict[str, Any]:
+    for path in (AI_CONFIG_PATH, LEGACY_GROQ_CONFIG):
+        try:
+            if not path.exists():
+                continue
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f) or {}
+            if path is LEGACY_GROQ_CONFIG:
+                # Migrate the single-provider file written by earlier versions.
+                legacy = str(data.get('groq_api_key', '')).strip()
+                return {'keys': {'groq': legacy}} if legacy else {}
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"Could not read {path.name}: {e}")
+    return {}
+
+
+def _write_local_config(data: Dict[str, Any]) -> bool:
+    """Write the config with owner-only permissions."""
     try:
-        cfg_path = Path.cwd() / '.groq_config.json'
-        json.dump({"groq_api_key": api_key.strip()}, open(cfg_path, 'w', encoding='utf-8'))
+        payload = json.dumps(data, indent=2).encode('utf-8')
+        # Create with 0600 before any secret reaches the file, so it is never
+        # briefly world-readable.
+        fd = os.open(AI_CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(AI_CONFIG_PATH, 0o600)
+        except OSError:
+            # Windows ignores POSIX modes; the file still lands in a
+            # user-profile directory and is gitignored.
+            pass
         return True
-    except Exception as e:
-        logger.error(f"Failed to save Groq API key: {e}")
+    except OSError as e:
+        logger.error(f"Could not save AI settings: {e}")
         return False
 
+
+def _secret(name: str) -> str:
+    try:
+        if hasattr(st, 'secrets') and name in st.secrets:
+            return str(st.secrets[name]).strip()
+    except Exception:
+        pass
+    return ''
+
+
+def load_api_key(provider: AIProviderSpec) -> str:
+    """Resolve a provider's key: secrets, then environment, then local file.
+
+    Never logged — only its presence is ever reported.
+    """
+    for name in (f"{provider.key}_api_key", provider.key):
+        value = _secret(name)
+        if value:
+            return value
+    for env_var in provider.env_vars:
+        value = os.getenv(env_var, '').strip()
+        if value:
+            return value
+    stored = _read_local_config().get('keys') or {}
+    return str(stored.get(provider.key, '') or '').strip()
+
+
+def save_api_key(provider: AIProviderSpec, api_key: str) -> bool:
+    """Persist one provider's key, leaving the others untouched."""
+    data = _read_local_config()
+    keys = dict(data.get('keys') or {})
+    if api_key.strip():
+        keys[provider.key] = api_key.strip()
+    else:
+        keys.pop(provider.key, None)
+    data['keys'] = keys
+    return _write_local_config(data)
+
+
+def forget_api_key(provider: AIProviderSpec) -> bool:
+    return save_api_key(provider, '')
+
+
+def load_ai_preferences() -> Tuple[str, Dict[str, str]]:
+    """Return the last selected provider and any per-provider model overrides."""
+    data = _read_local_config()
+    provider = str(data.get('provider') or DEFAULT_PROVIDER)
+    models = {str(k): str(v) for k, v in (data.get('models') or {}).items()}
+    return (provider if provider in AI_PROVIDERS else DEFAULT_PROVIDER), models
+
+
+def save_ai_preferences(provider_key: str, model: str) -> bool:
+    """Remember the chosen provider and its model. No secrets involved."""
+    data = _read_local_config()
+    data['provider'] = provider_key
+    models = dict(data.get('models') or {})
+    if model.strip():
+        models[provider_key] = model.strip()
+    else:
+        models.pop(provider_key, None)
+    data['models'] = models
+    return _write_local_config(data)
+
+
+# -----------------------------------------------------------------------------
+# Client construction
+# -----------------------------------------------------------------------------
+
+def build_ai_client(settings: AISettings):
+    """Return a client exposing `.chat.completions.create` for this provider.
+
+    Groq keeps its own SDK so the path that already works stays exactly as it
+    was; everything else goes through the OpenAI-compatible client. Both
+    expose the same call surface, so no caller needs to know the difference.
+    """
+    if not settings.ready:
+        raise AIServiceError(
+            f"No {settings.provider.key_label} set. Add one in the sidebar to use AI features.",
+            'auth',
+        )
+
+    api_key = settings.api_key.strip()
+    if settings.provider.native_sdk == 'groq':
+        try:
+            return Groq(api_key=api_key)
+        except Exception as e:
+            raise_ai_error(e)
+
+    if not OPENAI_SDK_AVAILABLE:
+        raise AIServiceError(
+            f"{settings.provider.label} needs the `openai` package. "
+            "Install it with `pip install openai` and restart the app.",
+            'config',
+        )
+    try:
+        return OpenAI(
+            api_key=api_key,
+            base_url=settings.provider.base_url,
+            default_headers=dict(settings.provider.extra_headers) or None,
+            timeout=120.0,
+            max_retries=2,
+        )
+    except Exception as e:
+        raise_ai_error(e)
+
+
+def list_provider_models(settings: AISettings, limit: int = 300) -> List[str]:
+    """Ask the provider which models it currently serves.
+
+    Model ids churn constantly — Gemini retires numbered versions, OpenRouter
+    adds models weekly — so a hardcoded dropdown goes stale. Every
+    OpenAI-compatible provider exposes GET /models, so the list can just be
+    asked for.
+    """
+    client = build_ai_client(settings)
+    try:
+        response = client.models.list()
+    except Exception as e:
+        raise_ai_error(e)
+    names: List[str] = []
+    for item in getattr(response, 'data', None) or []:
+        model_id = getattr(item, 'id', None) or (item.get('id') if isinstance(item, dict) else None)
+        if model_id:
+            names.append(str(model_id))
+    return sorted(set(names))[:limit]
 
 # =============================================================================
 # CACHING
@@ -4794,7 +5080,7 @@ def has_listing(folder_info: Dict[str, Any], platform: str) -> bool:
     return target in (folder_info.get('listing_files') or [])
 
 
-def generate_listing_for_folder(processor: "GroqProcessor", file_manager: "FileManager",
+def generate_listing_for_folder(processor: "AIProcessor", file_manager: "FileManager",
                                 folder_info: Dict[str, Any], platform: str,
                                 custom_instructions: str = "") -> Tuple[str, Path]:
     """Generate one listing and write it into the product folder.
@@ -4819,7 +5105,7 @@ def generate_listing_for_folder(processor: "GroqProcessor", file_manager: "FileM
     return text, out_path
 
 
-def render_bulk_generator(groq_api_key: str, file_manager: "FileManager") -> None:
+def render_bulk_generator(settings: AISettings, file_manager: "FileManager") -> None:
     """Generate listings for many scraped folders in one run.
 
     This is the batch counterpart to the single-folder generator: after a
@@ -4864,7 +5150,7 @@ def render_bulk_generator(groq_api_key: str, file_manager: "FileManager") -> Non
         stopped = ''
 
         try:
-            processor = GroqProcessor(groq_api_key)
+            processor = AIProcessor(settings)
         except AIServiceError as e:
             st.error(str(e))
             return
@@ -4930,7 +5216,7 @@ def _load_folder_context(file_manager: "FileManager", folder_info: Dict[str, str
     return f"\n\nCONTEXT:\n{content[:limit]}" if content else ""
 
 
-def render_content_generator(groq_api_key: str, file_manager: "FileManager") -> None:
+def render_content_generator(settings: AISettings, file_manager: "FileManager") -> None:
     """Turn a scraped folder into a listing written for one marketplace."""
     product_folders = file_manager.get_existing_product_folders()
     if not product_folders:
@@ -4974,7 +5260,7 @@ def render_content_generator(groq_api_key: str, file_manager: "FileManager") -> 
                     st.error(f"`{selected_file}` is empty. Pick another source file.")
                 else:
                     with st.spinner(f"Writing for {target_platform}..."):
-                        processor = GroqProcessor(groq_api_key)
+                        processor = AIProcessor(settings)
                         result_text = processor.platform_agent.generate_platform_description(
                             raw_text=original_content,
                             product_data=None,
@@ -5017,7 +5303,7 @@ def render_content_generator(groq_api_key: str, file_manager: "FileManager") -> 
             st.info("Pick a product and press Generate.")
 
 
-def render_ai_assistant(groq_api_key: str, file_manager: "FileManager") -> None:
+def render_ai_assistant(settings: AISettings, file_manager: "FileManager") -> None:
     """Free-form chat, optionally grounded in one scraped product folder."""
     product_folders = file_manager.get_existing_product_folders()
     context_options = ["No product context"] + [f["folder_name"] for f in product_folders]
@@ -5059,7 +5345,7 @@ def render_ai_assistant(groq_api_key: str, file_manager: "FileManager") -> None:
                     if folder_info:
                         context_text = _load_folder_context(file_manager, folder_info)
 
-                processor = GroqProcessor(groq_api_key)
+                processor = AIProcessor(settings)
                 system_prompt = (
                     "You are an e-commerce listing expert helping the owner of an eBay resale "
                     "store. Be specific and actionable. When CONTEXT is supplied, answer from it "
@@ -5100,25 +5386,26 @@ def render_ai_assistant(groq_api_key: str, file_manager: "FileManager") -> None:
         st.rerun()
 
 
-def render_ai_tab(groq_api_key: str, file_manager: "FileManager") -> None:
+def render_ai_tab(settings: AISettings, file_manager: "FileManager") -> None:
     """AI Processing tab: listing generator plus a product-aware assistant."""
     st.subheader("AI Processing")
-    st.caption("Generate platform-ready listings and ask questions about your scraped products.")
+    st.caption(f"Generate platform-ready listings and ask questions about your scraped "
+               f"products. Using **{settings.provider.label}** · `{settings.model_name}`.")
 
-    if not groq_api_key:
+    if not settings.ready:
         # Note: no st.stop() here — that would abort the whole script run and
         # leave every tab rendered after this one blank.
-        st.info("Add a Groq API key in the sidebar to enable these features. "
-                "Free keys are available at console.groq.com/keys.")
+        st.info(f"Add a {settings.provider.key_label} in the sidebar to enable these "
+                f"features. Create one at {settings.provider.console_url}.")
         return
 
     gen_tab, bulk_tab, chat_tab = st.tabs(["Content Generator", "Bulk Generate", "Assistant"])
     with gen_tab:
-        render_content_generator(groq_api_key, file_manager)
+        render_content_generator(settings, file_manager)
     with bulk_tab:
-        render_bulk_generator(groq_api_key, file_manager)
+        render_bulk_generator(settings, file_manager)
     with chat_tab:
-        render_ai_assistant(groq_api_key, file_manager)
+        render_ai_assistant(settings, file_manager)
 
 
 def inject_global_styles() -> None:
@@ -6013,8 +6300,8 @@ TAB_NAMES = [
 ]
 
 
-def render_sidebar() -> str:
-    """Brand block plus configuration. Returns the Groq API key to use."""
+def render_sidebar() -> AISettings:
+    """Brand block plus configuration. Returns the AI settings to use."""
     with st.sidebar:
         st.markdown(
             """
@@ -6030,21 +6317,86 @@ def render_sidebar() -> str:
         )
         st.markdown('<div class="es-side-section">Configuration</div>', unsafe_allow_html=True)
 
-        stored_key = load_groq_api_key()
-        groq_api_key = st.text_input(
-            "Groq API key", value=stored_key, type="password",
-            help="Needed for the AI Processing tab. Get one at console.groq.com/keys.",
+        saved_provider, saved_models = load_ai_preferences()
+        provider_keys = list(AI_PROVIDERS)
+        selected_key = st.selectbox(
+            "AI provider",
+            options=provider_keys,
+            index=provider_keys.index(saved_provider) if saved_provider in provider_keys else 0,
+            format_func=lambda k: AI_PROVIDERS[k].label,
+            help="Which service runs the AI features. Each keeps its own key.",
+        )
+        provider = get_provider(selected_key)
+
+        # Each provider gets its own key field, seeded from secrets, the
+        # environment or the saved config — switching provider never shows
+        # another provider's key.
+        #
+        # Session state is seeded once per widget rather than passing `value=`
+        # alongside `key=`. Streamlit drops the state of widgets that a run
+        # did not render, and mixing the two meant that after switching away
+        # and back the field came up blank even though the key was safely on
+        # disk. Seeding on absence re-reads storage in exactly that case.
+        stored_key = load_api_key(provider)
+        key_state = f"api_key_{provider.key}"
+        if key_state not in st.session_state:
+            st.session_state[key_state] = stored_key
+        api_key = st.text_input(
+            provider.key_label, type="password", key=key_state,
+            help=f"Create one at {provider.console_url}",
         ).strip()
 
-        if st.checkbox("Remember this key", value=bool(stored_key),
-                       help=f"Saves it to .groq_config.json in {Path.cwd().name}."):
-            if groq_api_key and groq_api_key != stored_key and not save_groq_api_key(groq_api_key):
+        remember_state = f"remember_{provider.key}"
+        if remember_state not in st.session_state:
+            st.session_state[remember_state] = bool(stored_key)
+        if st.checkbox("Remember this key", key=remember_state,
+                       help=f"Saves it to {AI_CONFIG_PATH.name} (owner-only permissions, gitignored)."):
+            if api_key and api_key != stored_key and not save_api_key(provider, api_key):
                 st.warning("The key could not be saved to disk.")
+        elif stored_key:
+            # Unticking is an explicit instruction to stop storing this key.
+            forget_api_key(provider)
 
-        if groq_api_key:
-            st.caption("AI features enabled.")
-        else:
-            st.caption("AI features need a key.")
+        model_state = f"model_{provider.key}"
+        if model_state not in st.session_state:
+            st.session_state[model_state] = saved_models.get(provider.key, provider.default_model)
+        model = st.text_input("Model", key=model_state, help=provider.model_hint).strip()
+
+        settings = AISettings(provider=provider, api_key=api_key, model=model)
+
+        if provider.key_prefix and api_key and not api_key.startswith(provider.key_prefix):
+            st.caption(f"That does not look like a {provider.label} key "
+                       f"(they usually start with `{provider.key_prefix}`).")
+
+        if st.button("Load available models", width='stretch', disabled=not settings.ready,
+                     help="Asks the provider which models it currently serves."):
+            try:
+                with st.spinner("Asking the provider..."):
+                    st.session_state.provider_models = list_provider_models(settings)
+                st.session_state.provider_models_for = provider.key
+            except AIServiceError as e:
+                st.session_state.provider_models = []
+                st.warning(str(e))
+
+        if (st.session_state.get('provider_models')
+                and st.session_state.get('provider_models_for') == provider.key):
+            available = st.session_state.provider_models
+            with st.expander(f"{len(available)} models available", expanded=False):
+                picked = st.selectbox("Pick one", options=available,
+                                      index=available.index(model) if model in available else 0,
+                                      key=f"pick_model_{provider.key}")
+                if st.button("Use this model", width='stretch'):
+                    st.session_state[model_state] = picked
+                    save_ai_preferences(provider.key, picked)
+                    st.rerun()
+
+        # Remember the provider and model (never the key) so the next start
+        # opens on the same setup.
+        if selected_key != saved_provider or model != saved_models.get(provider.key, ''):
+            save_ai_preferences(selected_key, model)
+
+        st.caption(f"AI features enabled — {provider.label}." if settings.ready
+                   else f"AI features need a {provider.key_label}.")
 
         st.markdown('<div class="es-side-section">Scraping</div>', unsafe_allow_html=True)
         if CURL_CFFI_AVAILABLE:
@@ -6056,7 +6408,7 @@ def render_sidebar() -> str:
         st.markdown('<div class="es-side-section">Files</div>', unsafe_allow_html=True)
         st.caption(f"Products: `EbayStore_Products.csv`\n\nHistory: `{BATCH_STATUS_LOG.name}`")
 
-    return groq_api_key
+    return settings
 
 
 def main():
@@ -6086,7 +6438,7 @@ def main():
         st.error(f"The application could not start: {e}")
         return
 
-    groq_api_key = render_sidebar()
+    ai_settings = render_sidebar()
 
     tab1, tab2, tab3, tab4, tab_fmt, tab5 = st.tabs(TAB_NAMES)
 
@@ -6133,7 +6485,7 @@ def main():
 
     # Tab 3: AI Processing
     with tab3:
-        render_ai_tab(groq_api_key, file_manager)
+        render_ai_tab(ai_settings, file_manager)
 
     # Tab 4: Image Enhancement
     with tab4:
